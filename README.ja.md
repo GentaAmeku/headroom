@@ -7,7 +7,7 @@ AI コーディングツールの**利用枠の残量を一目で**把握する 
 > Headroom = 残された余裕。壁にぶつかる前に残量を確認できます。
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="Claude / Cursor / Codex の利用枠を表示する Headroom のメニュー" width="300">
+  <img src="docs/screenshot.jpeg" alt="Claude / Cursor / Codex の利用枠を表示する Headroom のメニュー" width="720">
 </p>
 
 ## 対応ツール

@@ -7,7 +7,7 @@ A macOS **menu bar** app that shows your **AI coding tool usage quotas at a glan
 > Headroom = the room you have left. Check your remaining quota before you hit a wall.
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="Headroom menu showing Claude, Cursor, and Codex usage" width="300">
+  <img src="docs/screenshot.jpeg" alt="Headroom menu showing Claude, Cursor, and Codex usage" width="720">
 </p>
 
 ## Supported tools
