@@ -6,7 +6,7 @@ A macOS **menu bar** app that shows your **AI coding tool usage quotas at a glan
 
 > Headroom = the room you have left. Check your remaining quota before you hit a wall.
 
-![screenshot](docs/screenshot.png)
+<!-- TODO: add a screenshot of the open menu — ![screenshot](docs/screenshot.png) -->
 
 ## Supported tools
 

@@ -6,7 +6,7 @@ AI コーディングツールの**利用枠の残量を一目で**把握する 
 
 > Headroom = 残された余裕。壁にぶつかる前に残量を確認できます。
 
-![screenshot](docs/screenshot.png)
+<!-- TODO: メニューを開いた状態のスクショを追加 — ![screenshot](docs/screenshot.png) -->
 
 ## 対応ツール
 
