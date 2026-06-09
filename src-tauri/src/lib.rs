@@ -1,5 +1,8 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{
     menu::{IconMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
@@ -12,6 +15,7 @@ enum Status {
     Unconnected,
 }
 
+#[derive(Clone)]
 struct UsageWindow {
     label: String,
     consumption: f64,          // 0-100（% 表示の枠）
@@ -23,7 +27,9 @@ struct ToolSnapshot {
     display_name: String,
     status: Status,
     windows: Vec<UsageWindow>,
-    /// 失敗/未接続時の原因（短文）
+    /// windows が直近の成功値（古い）か。429 等で再取得できないとき true
+    stale: bool,
+    /// 失敗/未接続/stale 時の原因（短文）
     reason: Option<String>,
     /// 失敗/未接続時の対処（ユーザーが何をすればよいか）
     hint: Option<String>,
@@ -33,6 +39,54 @@ struct CollectError {
     status: Status,
     reason: String,
     hint: String,
+}
+
+// ---------- per-tool キャッシュ：直近成功値の保持＋レート制限クールダウン ----------
+#[derive(Default)]
+struct ToolCache {
+    last_good: Option<Vec<UsageWindow>>,
+    cooldown_until: Option<Instant>,
+}
+fn tool_cache() -> &'static Mutex<HashMap<&'static str, ToolCache>> {
+    static C: OnceLock<Mutex<HashMap<&'static str, ToolCache>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// HTTP 失敗を CollectError に変換。429 のときは `retry-after` を読んでクールダウンを記録する
+/// （= その間は再取得しない。利用枠ではなく usage 取得 API 側の制限）。
+fn http_error(name: &'static str, resp: &reqwest::blocking::Response, auth_hint: &str) -> CollectError {
+    let code = resp.status().as_u16();
+    if code == 429 {
+        let secs = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(900);
+        if let Ok(mut c) = tool_cache().lock() {
+            c.entry(name).or_default().cooldown_until = Some(Instant::now() + Duration::from_secs(secs));
+        }
+    }
+    let (reason, hint) = match code {
+        429 => (
+            "取得が一時的に制限中".to_string(),
+            "利用枠ではなく取得APIの制限です。後で自動再取得します".to_string(),
+        ),
+        401 | 403 => (format!("認証エラー ({code})"), auth_hint.to_string()),
+        500..=599 => (
+            format!("サーバーエラー ({code})"),
+            "時間をおいて「更新」してください".to_string(),
+        ),
+        _ => (
+            format!("取得に失敗しました (HTTP {code})"),
+            "「更新」を押して再試行してください".to_string(),
+        ),
+    };
+    CollectError {
+        status: Status::Failed,
+        reason,
+        hint,
+    }
 }
 
 // ---------- Claude collector (ADR-0001 / 0004: 読み取り専用) ----------
@@ -84,7 +138,7 @@ fn read_claude_token() -> Result<String, CollectError> {
 }
 
 /// blocking 取得（専用スレッドから呼ぶ。tauri の async runtime 上では呼ばない）
-fn collect_claude() -> Result<Vec<UsageWindow>, CollectError> {
+fn collect_claude(name: &'static str) -> Result<Vec<UsageWindow>, CollectError> {
     let token = read_claude_token()?;
     let client = reqwest::blocking::Client::new();
     let resp = client
@@ -100,30 +154,7 @@ fn collect_claude() -> Result<Vec<UsageWindow>, CollectError> {
         })?;
 
     if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let (reason, hint) = match code {
-            429 => (
-                "レート制限です (429)".to_string(),
-                "少し待ってから「更新」を押してください".to_string(),
-            ),
-            401 | 403 => (
-                format!("認証エラー ({code})"),
-                "Claude を一度起動・使用すると回復します".to_string(),
-            ),
-            500..=599 => (
-                format!("サーバーエラー ({code})"),
-                "時間をおいて「更新」してください".to_string(),
-            ),
-            _ => (
-                format!("取得に失敗しました (HTTP {code})"),
-                "「更新」を押して再試行してください".to_string(),
-            ),
-        };
-        return Err(CollectError {
-            status: Status::Failed,
-            reason,
-            hint,
-        });
+        return Err(http_error(name, &resp, "Claude を一度起動・使用すると回復します"));
     }
 
     let u: ClaudeUsage = resp.json().map_err(|_| CollectError {
@@ -204,7 +235,7 @@ fn read_codex_auth() -> Result<(String, String), CollectError> {
     Ok((auth.tokens.access_token, auth.tokens.account_id))
 }
 
-fn collect_codex() -> Result<Vec<UsageWindow>, CollectError> {
+fn collect_codex(name: &'static str) -> Result<Vec<UsageWindow>, CollectError> {
     let (token, account) = read_codex_auth()?;
     let client = reqwest::blocking::Client::new();
     let resp = client
@@ -221,30 +252,7 @@ fn collect_codex() -> Result<Vec<UsageWindow>, CollectError> {
         })?;
 
     if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let (reason, hint) = match code {
-            429 => (
-                "レート制限です (429)".to_string(),
-                "少し待ってから「更新」を押してください".to_string(),
-            ),
-            401 | 403 => (
-                format!("認証エラー ({code})"),
-                "Codex を一度起動・使用すると回復します".to_string(),
-            ),
-            500..=599 => (
-                format!("サーバーエラー ({code})"),
-                "時間をおいて「更新」してください".to_string(),
-            ),
-            _ => (
-                format!("取得に失敗しました (HTTP {code})"),
-                "「更新」を押して再試行してください".to_string(),
-            ),
-        };
-        return Err(CollectError {
-            status: Status::Failed,
-            reason,
-            hint,
-        });
+        return Err(http_error(name, &resp, "Codex を一度起動・使用すると回復します"));
     }
 
     let u: CodexUsageResp = resp.json().map_err(|_| CollectError {
@@ -373,7 +381,7 @@ fn cursor_reset_at(client: &reqwest::blocking::Client, token: &str) -> String {
     }
 }
 
-fn collect_cursor() -> Result<Vec<UsageWindow>, CollectError> {
+fn collect_cursor(name: &'static str) -> Result<Vec<UsageWindow>, CollectError> {
     let token = read_cursor_token()?;
     let client = reqwest::blocking::Client::new();
     let resp = client
@@ -390,30 +398,7 @@ fn collect_cursor() -> Result<Vec<UsageWindow>, CollectError> {
         })?;
 
     if !resp.status().is_success() {
-        let code = resp.status().as_u16();
-        let (reason, hint) = match code {
-            429 => (
-                "レート制限です (429)".to_string(),
-                "少し待ってから「更新」を押してください".to_string(),
-            ),
-            401 | 403 => (
-                format!("認証エラー ({code})"),
-                "Cursor を一度起動・ログインすると回復します".to_string(),
-            ),
-            500..=599 => (
-                format!("サーバーエラー ({code})"),
-                "時間をおいて「更新」してください".to_string(),
-            ),
-            _ => (
-                format!("取得に失敗しました (HTTP {code})"),
-                "「更新」を押して再試行してください".to_string(),
-            ),
-        };
-        return Err(CollectError {
-            status: Status::Failed,
-            reason,
-            hint,
-        });
+        return Err(http_error(name, &resp, "Cursor を一度起動・ログインすると回復します"));
     }
 
     let agg: CursorAggUsage = resp.json().map_err(|_| CollectError {
@@ -446,31 +431,77 @@ fn collect_cursor() -> Result<Vec<UsageWindow>, CollectError> {
     Ok(windows)
 }
 
-fn snapshot_for(name: &str, result: Result<Vec<UsageWindow>, CollectError>) -> ToolSnapshot {
-    match result {
-        Ok(windows) => ToolSnapshot {
-            display_name: name.into(),
-            status: Status::Ok,
-            windows,
-            reason: None,
-            hint: None,
-        },
-        Err(e) => ToolSnapshot {
-            display_name: name.into(),
-            status: e.status,
-            windows: vec![],
-            reason: Some(e.reason),
-            hint: Some(e.hint),
-        },
+/// 取得を実行してスナップショット化する。クールダウン中は取得せず直近値(stale)を表示し、
+/// 失敗時も直近の成功値があればそれを stale として保持する（AGENTS.md ガードレール1）。
+fn collect_tool(
+    name: &'static str,
+    collector: fn(&'static str) -> Result<Vec<UsageWindow>, CollectError>,
+) -> ToolSnapshot {
+    let now = Instant::now();
+    // クールダウン中：取得せず直近値(stale)＋残り時間を表示
+    if let Ok(cache) = tool_cache().lock() {
+        if let Some(tc) = cache.get(name) {
+            if let Some(until) = tc.cooldown_until {
+                if until > now {
+                    let mins = (until - now).as_secs() / 60 + 1;
+                    let has = tc.last_good.is_some();
+                    return ToolSnapshot {
+                        display_name: name.into(),
+                        status: if has { Status::Ok } else { Status::Failed },
+                        windows: tc.last_good.clone().unwrap_or_default(),
+                        stale: true,
+                        reason: Some(format!("取得が一時制限中（約{mins}分後に再取得）")),
+                        hint: if has {
+                            None
+                        } else {
+                            Some("利用枠ではなく取得APIの制限です".into())
+                        },
+                    };
+                }
+            }
+        }
+    }
+    match collector(name) {
+        Ok(windows) => {
+            if let Ok(mut cache) = tool_cache().lock() {
+                let tc = cache.entry(name).or_default();
+                tc.last_good = Some(windows.clone());
+                tc.cooldown_until = None;
+            }
+            ToolSnapshot {
+                display_name: name.into(),
+                status: Status::Ok,
+                windows,
+                stale: false,
+                reason: None,
+                hint: None,
+            }
+        }
+        Err(e) => {
+            // 失敗：直近の成功値があれば stale として表示（値＋理由）、無ければエラー表示
+            let last = tool_cache()
+                .lock()
+                .ok()
+                .and_then(|c| c.get(name).and_then(|tc| tc.last_good.clone()));
+            let has = last.is_some();
+            ToolSnapshot {
+                display_name: name.into(),
+                status: if has { Status::Ok } else { e.status },
+                windows: last.unwrap_or_default(),
+                stale: has,
+                reason: Some(e.reason),
+                hint: if has { None } else { Some(e.hint) },
+            }
+        }
     }
 }
 
 fn collect_all() -> Vec<ToolSnapshot> {
     // MVP 対象（Claude → Cursor → Codex）
     vec![
-        snapshot_for("Claude", collect_claude()),
-        snapshot_for("Cursor", collect_cursor()),
-        snapshot_for("Codex", collect_codex()),
+        collect_tool("Claude", collect_claude),
+        collect_tool("Cursor", collect_cursor),
+        collect_tool("Codex", collect_codex),
     ]
 }
 
@@ -615,8 +646,31 @@ fn build_menu(app: &tauri::AppHandle, tools: &[ToolSnapshot]) -> tauri::Result<M
                         Some(cents) => format!("${:.2}", cents / 100.0),
                         None => format!("残り {}%", (100.0 - w.consumption).round().max(0.0) as i64),
                     };
-                    let line = format!("    {}  ·  {}  ·  {}", w.label, value, fmt_reset(&w.resets_at));
+                    let line = format!(
+                        "    {}  ·  {}  ·  {}{}",
+                        w.label,
+                        value,
+                        fmt_reset(&w.resets_at),
+                        if t.stale { "  ·  前回値" } else { "" }
+                    );
                     b = b.item(&MenuItemBuilder::new(line).enabled(false).build(app)?);
+                }
+                // stale（再取得できず直近値を表示中）の理由を併記
+                if t.stale {
+                    if let Some(reason) = &t.reason {
+                        b = b.item(
+                            &MenuItemBuilder::new(format!("    ⚠ {reason}"))
+                                .enabled(false)
+                                .build(app)?,
+                        );
+                    }
+                    if let Some(hint) = &t.hint {
+                        b = b.item(
+                            &MenuItemBuilder::new(format!("       {hint}"))
+                                .enabled(false)
+                                .build(app)?,
+                        );
+                    }
                 }
             }
             // 失敗/未接続は理由＋対処をグレーで

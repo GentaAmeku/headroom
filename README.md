@@ -1,3 +1,5 @@
+<!-- Language: English | [日本語](README.ja.md) -->
+
 # Headroom
 
 A macOS **menu bar** app that shows your **AI coding tool usage quotas at a glance**. Click the icon to see how much of each tool's usage window you've consumed and when it resets — rendered as a native macOS menu (NSMenu).
