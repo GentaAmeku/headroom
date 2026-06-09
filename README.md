@@ -1,77 +1,79 @@
-<!-- Language: English | [日本語](README.ja.md) -->
+[English](README.en.md) | **日本語**
 
 # Headroom
 
-A macOS **menu bar** app that shows your **AI coding tool usage quotas at a glance**. Click the icon to see how much of each tool's usage window you've consumed and when it resets — rendered as a native macOS menu (NSMenu).
+AI コーディングツールの**利用枠の残量を一目で**把握する macOS の**メニューバー常駐アプリ**です。アイコンをクリックすると、各ツールの利用枠をどれだけ消費したか・いつリセットされるかが、macOS ネイティブのメニュー（NSMenu）で表示されます。
 
-> Headroom = the room you have left. Check your remaining quota before you hit a wall.
+> Headroom = 残された余裕。壁にぶつかる前に残量を確認できます。
 
 <p align="center">
-  <img src="docs/screenshot.jpeg" alt="Headroom menu showing Claude, Cursor, and Codex usage" width="720">
+  <img src="docs/screenshot.jpeg" alt="Claude / Cursor / Codex の利用枠を表示する Headroom のメニュー" width="720">
 </p>
 
-## Supported tools
+## 対応ツール
 
-| Tool | Shows | Source (read-only) |
-|------|-------|--------------------|
-| **Claude** | 5-Hour & Weekly | macOS Keychain `Claude Code-credentials` → `api.anthropic.com/api/oauth/usage` |
-| **Cursor** | Monthly (included) + On-Demand overage | `state.vscdb` (`cursorAuth/accessToken`) → `api2.cursor.sh` |
-| **Codex** | 5-Hour & Weekly | `~/.codex/auth.json` → `chatgpt.com/backend-api/codex/usage` |
+| ツール | 表示内容 | 取得元（読み取り専用） |
+|------|---------|------------------------|
+| **Claude** | 5時間 / 週次 | macOS Keychain `Claude Code-credentials` → `api.anthropic.com/api/oauth/usage` |
+| **Cursor** | 月次（含まれる枠）＋ On-Demand 超過 | `state.vscdb`（`cursorAuth/accessToken`）→ `api2.cursor.sh` |
+| **Codex** | 5時間 / 週次 | `~/.codex/auth.json` → `chatgpt.com/backend-api/codex/usage` |
 
-Each tool appears only if you're signed in to it; otherwise Headroom shows a gentle "not connected" note. Usage refreshes on launch, every 5 minutes, and via the **Refresh** menu item.
+各ツールはサインインしている場合のみ表示され、未サインインなら「未接続」と控えめに案内します。取得は起動時・5分間隔・メニューの「更新」で行います。
 
-## Privacy & security
+## プライバシーとセキュリティ
 
-- **Read-only.** Headroom never refreshes tokens or writes to any credential store.
-- **Local only.** Credentials never leave your machine; requests go directly to each tool's own API. No telemetry, no servers.
+- **読み取り専用。** トークンのリフレッシュや資格情報ストアへの書き込みは一切行いません。
+- **ローカル完結。** 認証情報は端末外に出さず、各ツール自身の API に直接アクセスします。テレメトリ・サーバーはありません。
 
-## Install
+## インストール
 
-### Homebrew (recommended)
+### Homebrew（推奨）
 
 ```sh
 brew install --cask --no-quarantine GentaAmeku/tap/headroom
 ```
 
-The app is not code-signed (it's a free, open-source utility), so `--no-quarantine` lets it open without a Gatekeeper prompt.
+このアプリはコード署名していない（無料・オープンソースのユーティリティ）ため、`--no-quarantine` を付けると Gatekeeper の警告なしで起動できます。
 
-### Manual
+### 手動
 
-1. Download `Headroom_<version>_universal.dmg` from [Releases](https://github.com/GentaAmeku/headroom/releases).
-2. Drag **Headroom.app** into Applications.
-3. On first launch, right-click the app → **Open** (once), or run:
+1. [Releases](https://github.com/GentaAmeku/headroom/releases) から `Headroom_<version>_universal.dmg` をダウンロード。
+2. **Headroom.app** を Applications にドラッグ。
+3. 初回起動はアプリを右クリック →「**開く**」（1回だけ）、または:
    ```sh
    xattr -dr com.apple.quarantine /Applications/Headroom.app
    ```
 
-Headroom registers itself as a **login item** so it starts automatically. Remove it anytime in System Settings → General → Login Items.
+Headroom は**ログイン項目**として自身を登録し、自動で起動します。解除は システム設定 →「一般」→「ログイン項目」から。
 
-## Configuration
+## 設定
 
-Cursor's "included" monthly budget varies by plan; Headroom defaults to **$20/month** and shows anything above it as a separate **On-Demand** line. Override the budget with either:
+Cursor の「含まれる」月予算はプランによって異なります。Headroom は既定で **$20/月** とし、それを超えた分は別行の **On-Demand** として表示します。予算は次のいずれかで上書きできます:
 
-- Environment variable: `HEADROOM_CURSOR_BUDGET=50`
-- or `~/.config/headroom/config.json`:
+- 環境変数: `HEADROOM_CURSOR_BUDGET=50`
+- または `~/.config/headroom/config.json`:
   ```json
-  { "cursorMonthlyBudgetUsd": 50 }
+  { "cursorMonthlyBudgetUsd": 50, "language": "en" }
   ```
 
-## Build from source
+**表示言語**は OS のロケールに自動追従します（日本語 / 英語）。固定したい場合は上の `config.json` で `"language"` を `"ja"` または `"en"` に設定してください。
 
-Requires [Rust](https://rustup.rs) and [Node.js](https://nodejs.org).
+## ソースからビルド
+
+[Rust](https://rustup.rs) と [Node.js](https://nodejs.org) が必要です。
 
 ```sh
 npm install
-npm run tauri build -- --bundles dmg     # release .dmg
-npm run tauri build -- --debug --bundles app   # quick debug build
+npm run tauri build -- --bundles dmg            # リリース .dmg
+npm run tauri build -- --debug --bundles app    # デバッグビルド
 ```
 
-The bundle lands in `src-tauri/target/<profile>/bundle/macos/Headroom.app`.
+成果物は `src-tauri/target/<profile>/bundle/macos/Headroom.app` に出力されます。
 
-## Contributing & internals
+## 開発・内部仕様
 
-Project conventions and architecture live in [`AGENTS.md`](AGENTS.md), with domain terms in [`CONTEXT.md`](CONTEXT.md), UI guidelines in [`design.md`](design.md), and decisions in [`docs/adr/`](docs/adr/).
+プロジェクトの規約とアーキテクチャは [`AGENTS.md`](AGENTS.md)、用語は [`CONTEXT.md`](CONTEXT.md)、UI 指針は [`design.md`](design.md)、決定記録は [`docs/adr/`](docs/adr/) にあります。
 
-## License
+## ライセンス
 
 [MIT](LICENSE) © gameku

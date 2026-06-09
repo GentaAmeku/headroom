@@ -42,6 +42,7 @@
 - Claude の usage 取得（実証済み）: **`~/.claude/.credentials.json` の `claudeAiOauth.accessToken`** を優先（旧来の Keychain `Claude Code-credentials` は更新されず**失効**していることがあるためフォールバック扱い）→ `GET https://api.anthropic.com/api/oauth/usage`（ヘッダ `Authorization: Bearer`, `anthropic-version: 2023-06-01`, `anthropic-beta: oauth-2025-04-20`）→ `five_hour` / `seven_day` の `{ utilization, resets_at }`。`expiresAt`(epoch ms) で**失効チェック**し、失効時は取得せず案内（**自前リフレッシュはしない**＝ADR-0004）。詳細は ADR-0001。
   - 注意: 失効した oauth トークンでこの endpoint を叩くと **429（rate_limit_error）が返る**（401 ではない）。「レート制限」と誤認しないこと。
 - レンダリング対象は macOS WKWebView（近年の WebKit）。モダン CSS（`light-dark()` / `color-mix()` / `corner-shape`）をフォールバックなしで使ってよい。
+- **多言語（i18n）**: UI 文字列は `tr(ja, en)` ヘルパで日本語/英語を出し分ける。言語は OS ロケール（`sys-locale`、`ja*`→日本語/それ以外→英語）で自動判定。`~/.config/headroom/config.json` の `"language": "ja"|"en"` で上書き可。新規の表示文字列は必ず `tr()`（または `match lang()`）でラップすること。
 
 ## ステータス
 

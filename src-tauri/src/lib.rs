@@ -8,6 +8,50 @@ use tauri::{
     tray::TrayIconBuilder,
 };
 
+// ---------- i18n（OS ロケール or ~/.config/headroom/config.json の "language" で ja/en を選択） ----------
+#[derive(Clone, Copy, PartialEq)]
+enum Lang {
+    Ja,
+    En,
+}
+fn lang() -> Lang {
+    static L: OnceLock<Lang> = OnceLock::new();
+    *L.get_or_init(|| {
+        if let Some(l) = config_language() {
+            return l;
+        }
+        match sys_locale::get_locale() {
+            Some(l) if l.to_lowercase().starts_with("ja") => Lang::Ja,
+            _ => Lang::En,
+        }
+    })
+}
+fn config_language() -> Option<Lang> {
+    let home = std::env::var("HOME").ok()?;
+    let data = std::fs::read_to_string(format!("{home}/.config/headroom/config.json")).ok()?;
+    #[derive(Deserialize)]
+    struct Cfg {
+        language: Option<String>,
+    }
+    match serde_json::from_str::<Cfg>(&data)
+        .ok()?
+        .language?
+        .to_lowercase()
+        .as_str()
+    {
+        "ja" | "japanese" => Some(Lang::Ja),
+        "en" | "english" => Some(Lang::En),
+        _ => None,
+    }
+}
+/// 言語に応じて文字列を選ぶ
+fn tr(ja: &'static str, en: &'static str) -> &'static str {
+    match lang() {
+        Lang::Ja => ja,
+        Lang::En => en,
+    }
+}
+
 // ---------- normalized model (ADR-0003) ----------
 enum Status {
     Ok,
@@ -69,17 +113,20 @@ fn http_error(name: &'static str, resp: &reqwest::blocking::Response, auth_hint:
     }
     let (reason, hint) = match code {
         429 => (
-            "取得が一時的に制限中".to_string(),
-            "利用枠ではなく取得APIの制限です。後で自動再取得します".to_string(),
+            tr("取得が一時的に制限中", "Fetch rate-limited").to_string(),
+            tr("利用枠ではなく取得APIの制限です。後で自動再取得します", "Usage API is throttled (not your quota). Retrying soon.").to_string(),
         ),
-        401 | 403 => (format!("認証エラー ({code})"), auth_hint.to_string()),
+        401 | 403 => (
+            format!("{} ({code})", tr("認証エラー", "Auth error")),
+            auth_hint.to_string(),
+        ),
         500..=599 => (
-            format!("サーバーエラー ({code})"),
-            "時間をおいて「更新」してください".to_string(),
+            format!("{} ({code})", tr("サーバーエラー", "Server error")),
+            tr("時間をおいて「更新」してください", "Try Refresh again later").to_string(),
         ),
         _ => (
-            format!("取得に失敗しました (HTTP {code})"),
-            "「更新」を押して再試行してください".to_string(),
+            format!("{} (HTTP {code})", tr("取得に失敗しました", "Fetch failed")),
+            tr("「更新」を押して再試行してください", "Press Refresh to retry").to_string(),
         ),
     };
     CollectError {
@@ -168,14 +215,14 @@ fn read_claude_token() -> Result<String, CollectError> {
     if expired {
         Err(CollectError {
             status: Status::Failed,
-            reason: "認証の有効期限切れ".into(),
-            hint: "Claude Code を一度使うと自動で更新されます".into(),
+            reason: tr("認証の有効期限切れ", "Authentication expired").into(),
+            hint: tr("Claude Code を一度使うと自動で更新されます", "Use Claude Code once to refresh").into(),
         })
     } else {
         Err(CollectError {
             status: Status::Unconnected,
-            reason: "未接続です".into(),
-            hint: "Claude にログインすると表示されます".into(),
+            reason: tr("未接続です", "Not connected").into(),
+            hint: tr("Claude にログインすると表示されます", "Sign in to Claude to see usage").into(),
         })
     }
 }
@@ -193,18 +240,18 @@ fn collect_claude(name: &'static str) -> Result<Vec<UsageWindow>, CollectError> 
         .send()
         .map_err(|_| CollectError {
             status: Status::Failed,
-            reason: "接続できません".into(),
-            hint: "ネットワーク接続を確認してください".into(),
+            reason: tr("接続できません", "Can't connect").into(),
+            hint: tr("ネットワーク接続を確認してください", "Check your network connection").into(),
         })?;
 
     if !resp.status().is_success() {
-        return Err(http_error(name, &resp, "Claude を一度起動・使用すると回復します"));
+        return Err(http_error(name, &resp, tr("Claude を一度起動・使用すると回復します", "Open and use Claude once to recover")));
     }
 
     let u: ClaudeUsage = resp.json().map_err(|_| CollectError {
         status: Status::Failed,
-        reason: "応答を解析できませんでした".into(),
-        hint: "アプリの更新が必要かもしれません".into(),
+        reason: tr("応答を解析できませんでした", "Couldn't parse the response").into(),
+        hint: tr("アプリの更新が必要かもしれません", "The app may need an update").into(),
     })?;
 
     let mut windows = Vec::new();
@@ -261,20 +308,20 @@ fn epoch_to_rfc3339(epoch: i64) -> String {
 fn read_codex_auth() -> Result<(String, String), CollectError> {
     let home = std::env::var("HOME").map_err(|_| CollectError {
         status: Status::Failed,
-        reason: "ホームディレクトリが不明です".into(),
-        hint: "再度お試しください".into(),
+        reason: tr("ホームディレクトリが不明です", "Home directory not found").into(),
+        hint: tr("再度お試しください", "Please try again").into(),
     })?;
     let data = std::fs::read_to_string(format!("{home}/.codex/auth.json")).map_err(|_| {
         CollectError {
             status: Status::Unconnected,
-            reason: "未接続です".into(),
-            hint: "Codex にログインすると表示されます".into(),
+            reason: tr("未接続です", "Not connected").into(),
+            hint: tr("Codex にログインすると表示されます", "Sign in to Codex to see usage").into(),
         }
     })?;
     let auth: CodexAuth = serde_json::from_str(&data).map_err(|_| CollectError {
         status: Status::Failed,
-        reason: "資格情報を解析できません".into(),
-        hint: "Codex に再ログインしてください".into(),
+        reason: tr("資格情報を解析できません", "Couldn't parse credentials").into(),
+        hint: tr("Codex に再ログインしてください", "Sign in to Codex again").into(),
     })?;
     Ok((auth.tokens.access_token, auth.tokens.account_id))
 }
@@ -291,23 +338,23 @@ fn collect_codex(name: &'static str) -> Result<Vec<UsageWindow>, CollectError> {
         .send()
         .map_err(|_| CollectError {
             status: Status::Failed,
-            reason: "接続できません".into(),
-            hint: "ネットワーク接続を確認してください".into(),
+            reason: tr("接続できません", "Can't connect").into(),
+            hint: tr("ネットワーク接続を確認してください", "Check your network connection").into(),
         })?;
 
     if !resp.status().is_success() {
-        return Err(http_error(name, &resp, "Codex を一度起動・使用すると回復します"));
+        return Err(http_error(name, &resp, tr("Codex を一度起動・使用すると回復します", "Open and use Codex once to recover")));
     }
 
     let u: CodexUsageResp = resp.json().map_err(|_| CollectError {
         status: Status::Failed,
-        reason: "応答を解析できませんでした".into(),
-        hint: "アプリの更新が必要かもしれません".into(),
+        reason: tr("応答を解析できませんでした", "Couldn't parse the response").into(),
+        hint: tr("アプリの更新が必要かもしれません", "The app may need an update").into(),
     })?;
     let rl = u.rate_limit.ok_or(CollectError {
         status: Status::Failed,
-        reason: "利用枠情報がありません".into(),
-        hint: "Codex を一度使ってみてください".into(),
+        reason: tr("利用枠情報がありません", "No usage data").into(),
+        hint: tr("Codex を一度使ってみてください", "Try using Codex once").into(),
     })?;
 
     let mut windows = Vec::new();
@@ -381,8 +428,8 @@ struct CursorReqUsage {
 fn read_cursor_token() -> Result<String, CollectError> {
     let home = std::env::var("HOME").map_err(|_| CollectError {
         status: Status::Failed,
-        reason: "ホームディレクトリが不明です".into(),
-        hint: "再度お試しください".into(),
+        reason: tr("ホームディレクトリが不明です", "Home directory not found").into(),
+        hint: tr("再度お試しください", "Please try again").into(),
     })?;
     let db = format!("{home}/Library/Application Support/Cursor/User/globalStorage/state.vscdb");
     // macOS 同梱の sqlite3 で平文値を読み取る（追加依存なし・読み取り専用）
@@ -392,8 +439,8 @@ fn read_cursor_token() -> Result<String, CollectError> {
         .output()
         .map_err(|_| CollectError {
             status: Status::Unconnected,
-            reason: "未接続です".into(),
-            hint: "Cursor にログインすると表示されます".into(),
+            reason: tr("未接続です", "Not connected").into(),
+            hint: tr("Cursor にログインすると表示されます", "Sign in to Cursor to see usage").into(),
         })?;
     let token = String::from_utf8_lossy(&out.stdout)
         .trim()
@@ -402,8 +449,8 @@ fn read_cursor_token() -> Result<String, CollectError> {
     if !out.status.success() || token.is_empty() {
         return Err(CollectError {
             status: Status::Unconnected,
-            reason: "未接続です".into(),
-            hint: "Cursor にログインすると表示されます".into(),
+            reason: tr("未接続です", "Not connected").into(),
+            hint: tr("Cursor にログインすると表示されます", "Sign in to Cursor to see usage").into(),
         });
     }
     Ok(token)
@@ -437,18 +484,18 @@ fn collect_cursor(name: &'static str) -> Result<Vec<UsageWindow>, CollectError> 
         .send()
         .map_err(|_| CollectError {
             status: Status::Failed,
-            reason: "接続できません".into(),
-            hint: "ネットワーク接続を確認してください".into(),
+            reason: tr("接続できません", "Can't connect").into(),
+            hint: tr("ネットワーク接続を確認してください", "Check your network connection").into(),
         })?;
 
     if !resp.status().is_success() {
-        return Err(http_error(name, &resp, "Cursor を一度起動・ログインすると回復します"));
+        return Err(http_error(name, &resp, tr("Cursor を一度起動・ログインすると回復します", "Open and sign in to Cursor to recover")));
     }
 
     let agg: CursorAggUsage = resp.json().map_err(|_| CollectError {
         status: Status::Failed,
-        reason: "応答を解析できませんでした".into(),
-        hint: "アプリの更新が必要かもしれません".into(),
+        reason: tr("応答を解析できませんでした", "Couldn't parse the response").into(),
+        hint: tr("アプリの更新が必要かもしれません", "The app may need an update").into(),
     })?;
 
     let spent = agg.total_cost_cents.unwrap_or(0.0).max(0.0);
@@ -494,11 +541,14 @@ fn collect_tool(
                         status: if has { Status::Ok } else { Status::Failed },
                         windows: tc.last_good.clone().unwrap_or_default(),
                         stale: true,
-                        reason: Some(format!("取得が一時制限中（約{mins}分後に再取得）")),
+                        reason: Some(match lang() {
+                            Lang::Ja => format!("取得が一時制限中（約{mins}分後に再取得）"),
+                            Lang::En => format!("Fetch limited (retry in ~{mins}m)"),
+                        }),
                         hint: if has {
                             None
                         } else {
-                            Some("利用枠ではなく取得APIの制限です".into())
+                            Some(tr("利用枠ではなく取得APIの制限です", "Usage API is throttled, not your quota").into())
                         },
                     };
                 }
@@ -556,16 +606,19 @@ fn fmt_reset(iso: &str) -> String {
         Ok(t) => {
             let secs = (t.with_timezone(&Utc) - Utc::now()).num_seconds();
             if secs <= 0 {
-                "まもなくリセット".into()
+                tr("まもなくリセット", "resets soon").into()
             } else if secs >= 2 * 86400 {
-                t.with_timezone(&Local).format("%-m月%-d日").to_string()
+                t.with_timezone(&Local)
+                    .format(tr("%-m月%-d日", "%b %-d"))
+                    .to_string()
             } else {
                 let h = secs / 3600;
                 let m = (secs % 3600) / 60;
-                if h > 0 {
-                    format!("{h}時間{m}分後")
-                } else {
-                    format!("{m}分後")
+                match (lang(), h > 0) {
+                    (Lang::Ja, true) => format!("{h}時間{m}分後"),
+                    (Lang::Ja, false) => format!("{m}分後"),
+                    (Lang::En, true) => format!("in {h}h {m}m"),
+                    (Lang::En, false) => format!("in {m}m"),
                 }
             }
         }
@@ -688,14 +741,20 @@ fn build_menu(app: &tauri::AppHandle, tools: &[ToolSnapshot]) -> tauri::Result<M
                     // 金額枠（On-Demand）は実額、それ以外は「残り %」
                     let value = match w.amount_cents {
                         Some(cents) => format!("${:.2}", cents / 100.0),
-                        None => format!("残り {}%", (100.0 - w.consumption).round().max(0.0) as i64),
+                        None => {
+                            let n = (100.0 - w.consumption).round().max(0.0) as i64;
+                            match lang() {
+                                Lang::Ja => format!("残り {n}%"),
+                                Lang::En => format!("{n}% left"),
+                            }
+                        }
                     };
                     let line = format!(
                         "    {}  ·  {}  ·  {}{}",
                         w.label,
                         value,
                         fmt_reset(&w.resets_at),
-                        if t.stale { "  ·  前回値" } else { "" }
+                        if t.stale { tr("  ·  前回値", "  ·  cached") } else { "" }
                     );
                     b = b.item(&MenuItemBuilder::new(line).enabled(false).build(app)?);
                 }
@@ -737,8 +796,8 @@ fn build_menu(app: &tauri::AppHandle, tools: &[ToolSnapshot]) -> tauri::Result<M
         }
     }
     b = b.separator();
-    b = b.item(&MenuItemBuilder::with_id("refresh", "更新").build(app)?);
-    b = b.item(&MenuItemBuilder::with_id("quit", "Quit Headroom").build(app)?);
+    b = b.item(&MenuItemBuilder::with_id("refresh", tr("更新", "Refresh")).build(app)?);
+    b = b.item(&MenuItemBuilder::with_id("quit", tr("Headroom を終了", "Quit Headroom")).build(app)?);
     b.build()
 }
 
@@ -776,8 +835,8 @@ pub fn run() {
             }
 
             // 初期メニュー（取得前）
-            let loading = MenuItemBuilder::new("読み込み中…").enabled(false).build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "Quit Headroom").build(app)?;
+            let loading = MenuItemBuilder::new(tr("読み込み中…", "Loading…")).enabled(false).build(app)?;
+            let quit = MenuItemBuilder::with_id("quit", tr("Headroom を終了", "Quit Headroom")).build(app)?;
             let init_menu = MenuBuilder::new(app)
                 .item(&loading)
                 .separator()
