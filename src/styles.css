@@ -1,0 +1,83 @@
+/* AI Tracker — popover styles (案A / design.md のトークン) */
+:root {
+  color-scheme: light dark;
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+
+  --surface:   light-dark(#ffffff, #232326);
+  --surface-2: light-dark(oklch(0.985 0.004 255), oklch(0.255 0.006 270));
+  --border:    light-dark(oklch(0.91 0.006 270), oklch(0.34 0.006 270));
+  --hairline:  light-dark(oklch(0.93 0.005 270), oklch(0.30 0.006 270));
+  --track:     light-dark(oklch(0.92 0.006 270), oklch(0.33 0.008 270));
+
+  --text:       light-dark(oklch(0.27 0.02 265), oklch(0.96 0.01 265));
+  --text-muted: light-dark(oklch(0.56 0.02 265), oklch(0.70 0.02 265));
+  --text-faint: light-dark(oklch(0.68 0.015 265), oklch(0.56 0.02 265));
+
+  --ok:     light-dark(oklch(0.60 0.14 150), oklch(0.74 0.15 152));
+  --warn:   light-dark(oklch(0.72 0.14 78),  oklch(0.80 0.15 80));
+  --danger: light-dark(oklch(0.57 0.20 27),  oklch(0.70 0.20 25));
+
+  --radius-card: 12px;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  /* 背景はネイティブの vibrancy（すりガラス）を見せるため透明 */
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.head { display: flex; align-items: center; justify-content: space-between; padding: .8rem 1rem .65rem; }
+.head__title { font-size: .82rem; font-weight: 600; letter-spacing: .01em; }
+.head__meta { font-size: .72rem; color: var(--text-faint); }
+
+.body { padding: .25rem .7rem .5rem; display: flex; flex-direction: column; gap: .5rem; }
+
+.foot {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: .6rem 1rem; border-block-start: 1px solid var(--hairline);
+  font-size: .72rem; color: var(--text-faint);
+}
+.foot button { font: inherit; cursor: pointer; border: none; background: none; color: var(--text-muted); padding: .25rem .4rem; border-radius: 6px; min-block-size: 24px; }
+.foot button:hover { color: var(--text); }
+.foot button:focus-visible { outline: 2px solid var(--ok); outline-offset: 2px; }
+
+/* tool card — vibrancy 上に馴染むよう半透明 */
+.card { background: color-mix(in srgb, var(--surface-2) 55%, transparent); border: 1px solid color-mix(in srgb, var(--hairline) 70%, transparent); border-radius: var(--radius-card); corner-shape: squircle; padding: .65rem .75rem; }
+.card__head { display: flex; align-items: center; gap: .5rem; margin-block-end: .55rem; }
+.card__name { font-size: .82rem; font-weight: 600; }
+.card__state { margin-inline-start: auto; font-size: .68rem; color: var(--text-faint); }
+.dot { inline-size: 18px; block-size: 18px; border-radius: 6px; corner-shape: squircle; display: grid; place-items: center; font-size: .62rem; font-weight: 700; color: #fff; flex: none; }
+.dot--claude { background: oklch(0.62 0.14 40); }
+.dot--cursor { background: oklch(0.45 0.02 265); }
+.dot--codex  { background: oklch(0.55 0.12 200); }
+
+/* status drives --c */
+.s-ok { --c: var(--ok); }
+.s-warn { --c: var(--warn); }
+.s-danger { --c: var(--danger); }
+
+/* usage window */
+.win + .win { margin-block-start: .6rem; }
+.win__top { display: flex; align-items: baseline; justify-content: space-between; margin-block-end: .3rem; }
+.win__label { font-size: .76rem; color: var(--text-muted); }
+.win__pct { font-size: .82rem; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--c, var(--text)); }
+.bar { block-size: 6px; border-radius: 999px; background: var(--track); overflow: clip; }
+.bar > i { display: block; block-size: 100%; inline-size: var(--p); border-radius: inherit; background: var(--c); }
+.win__reset { font-size: .68rem; color: var(--text-faint); margin-block-start: .28rem; }
+
+/* failed / unconnected */
+.card.is-failed { border-color: color-mix(in oklab, var(--danger) 45%, var(--hairline)); }
+.card.is-unconnected .banner { color: var(--text-faint); }
+.banner { display: flex; align-items: center; gap: .4rem; font-size: .7rem; color: var(--danger); }
+.banner button { font: inherit; color: var(--danger); background: none; border: 1px solid color-mix(in oklab, var(--danger) 40%, transparent); border-radius: 6px; padding: .12rem .5rem; cursor: pointer; margin-inline-start: auto; min-block-size: 24px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .bar > i { transition: inline-size .4s ease; }
+}

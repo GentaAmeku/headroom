@@ -1,0 +1,726 @@
+use serde::Deserialize;
+use std::process::Command;
+use tauri::{
+    menu::{IconMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder},
+    tray::TrayIconBuilder,
+};
+
+// ---------- normalized model (ADR-0003) ----------
+enum Status {
+    Ok,
+    Failed,
+    Unconnected,
+}
+
+struct UsageWindow {
+    label: String,
+    consumption: f64,          // 0-100（% 表示の枠）
+    amount_cents: Option<f64>, // Some なら金額(¢)で表示（On-Demand 用）。その場合 consumption は無視
+    resets_at: String,         // ISO8601
+}
+
+struct ToolSnapshot {
+    display_name: String,
+    status: Status,
+    windows: Vec<UsageWindow>,
+    /// 失敗/未接続時の原因（短文）
+    reason: Option<String>,
+    /// 失敗/未接続時の対処（ユーザーが何をすればよいか）
+    hint: Option<String>,
+}
+
+struct CollectError {
+    status: Status,
+    reason: String,
+    hint: String,
+}
+
+// ---------- Claude collector (ADR-0001 / 0004: 読み取り専用) ----------
+#[derive(Deserialize)]
+struct ClaudeCreds {
+    #[serde(rename = "claudeAiOauth")]
+    claude_ai_oauth: ClaudeOAuth,
+}
+#[derive(Deserialize)]
+struct ClaudeOAuth {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+}
+#[derive(Deserialize)]
+struct ClaudeUsage {
+    five_hour: Option<ClaudeWindow>,
+    seven_day: Option<ClaudeWindow>,
+}
+#[derive(Deserialize)]
+struct ClaudeWindow {
+    utilization: f64,
+    resets_at: String,
+}
+
+fn read_claude_token() -> Result<String, CollectError> {
+    let out = Command::new("security")
+        .args(["find-generic-password", "-w", "-s", "Claude Code-credentials"])
+        .output()
+        .map_err(|_| CollectError {
+            status: Status::Failed,
+            reason: "資格情報を取得できません".into(),
+            hint: "もう一度「更新」を押してください".into(),
+        })?;
+    if !out.status.success() {
+        return Err(CollectError {
+            status: Status::Unconnected,
+            reason: "未接続です".into(),
+            hint: "Claude にログインすると表示されます".into(),
+        });
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str::<ClaudeCreds>(raw.trim())
+        .map(|c| c.claude_ai_oauth.access_token)
+        .map_err(|_| CollectError {
+            status: Status::Failed,
+            reason: "資格情報を解析できません".into(),
+            hint: "Claude に再ログインしてください".into(),
+        })
+}
+
+/// blocking 取得（専用スレッドから呼ぶ。tauri の async runtime 上では呼ばない）
+fn collect_claude() -> Result<Vec<UsageWindow>, CollectError> {
+    let token = read_claude_token()?;
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("User-Agent", "headroom/0.1")
+        .send()
+        .map_err(|_| CollectError {
+            status: Status::Failed,
+            reason: "接続できません".into(),
+            hint: "ネットワーク接続を確認してください".into(),
+        })?;
+
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let (reason, hint) = match code {
+            429 => (
+                "レート制限です (429)".to_string(),
+                "少し待ってから「更新」を押してください".to_string(),
+            ),
+            401 | 403 => (
+                format!("認証エラー ({code})"),
+                "Claude を一度起動・使用すると回復します".to_string(),
+            ),
+            500..=599 => (
+                format!("サーバーエラー ({code})"),
+                "時間をおいて「更新」してください".to_string(),
+            ),
+            _ => (
+                format!("取得に失敗しました (HTTP {code})"),
+                "「更新」を押して再試行してください".to_string(),
+            ),
+        };
+        return Err(CollectError {
+            status: Status::Failed,
+            reason,
+            hint,
+        });
+    }
+
+    let u: ClaudeUsage = resp.json().map_err(|_| CollectError {
+        status: Status::Failed,
+        reason: "応答を解析できませんでした".into(),
+        hint: "アプリの更新が必要かもしれません".into(),
+    })?;
+
+    let mut windows = Vec::new();
+    if let Some(w) = u.five_hour {
+        windows.push(UsageWindow {
+            label: "5-Hour".into(),
+            consumption: w.utilization,
+            amount_cents: None,
+            resets_at: w.resets_at,
+        });
+    }
+    if let Some(w) = u.seven_day {
+        windows.push(UsageWindow {
+            label: "Weekly".into(),
+            consumption: w.utilization,
+            amount_cents: None,
+            resets_at: w.resets_at,
+        });
+    }
+    Ok(windows)
+}
+
+// ---------- Codex collector (ChatGPT OAuth, ~/.codex/auth.json, 読み取り専用) ----------
+#[derive(Deserialize)]
+struct CodexAuth {
+    tokens: CodexTokens,
+}
+#[derive(Deserialize)]
+struct CodexTokens {
+    access_token: String,
+    account_id: String,
+}
+#[derive(Deserialize)]
+struct CodexUsageResp {
+    rate_limit: Option<CodexRateLimit>,
+}
+#[derive(Deserialize)]
+struct CodexRateLimit {
+    primary_window: Option<CodexWindow>,
+    secondary_window: Option<CodexWindow>,
+}
+#[derive(Deserialize)]
+struct CodexWindow {
+    used_percent: f64,
+    reset_at: Option<i64>, // epoch 秒
+}
+
+fn epoch_to_rfc3339(epoch: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn read_codex_auth() -> Result<(String, String), CollectError> {
+    let home = std::env::var("HOME").map_err(|_| CollectError {
+        status: Status::Failed,
+        reason: "ホームディレクトリが不明です".into(),
+        hint: "再度お試しください".into(),
+    })?;
+    let data = std::fs::read_to_string(format!("{home}/.codex/auth.json")).map_err(|_| {
+        CollectError {
+            status: Status::Unconnected,
+            reason: "未接続です".into(),
+            hint: "Codex にログインすると表示されます".into(),
+        }
+    })?;
+    let auth: CodexAuth = serde_json::from_str(&data).map_err(|_| CollectError {
+        status: Status::Failed,
+        reason: "資格情報を解析できません".into(),
+        hint: "Codex に再ログインしてください".into(),
+    })?;
+    Ok((auth.tokens.access_token, auth.tokens.account_id))
+}
+
+fn collect_codex() -> Result<Vec<UsageWindow>, CollectError> {
+    let (token, account) = read_codex_auth()?;
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("https://chatgpt.com/backend-api/codex/usage")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("ChatGPT-Account-ID", account)
+        .header("originator", "codex_cli_rs")
+        .header("User-Agent", "headroom/0.1")
+        .send()
+        .map_err(|_| CollectError {
+            status: Status::Failed,
+            reason: "接続できません".into(),
+            hint: "ネットワーク接続を確認してください".into(),
+        })?;
+
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let (reason, hint) = match code {
+            429 => (
+                "レート制限です (429)".to_string(),
+                "少し待ってから「更新」を押してください".to_string(),
+            ),
+            401 | 403 => (
+                format!("認証エラー ({code})"),
+                "Codex を一度起動・使用すると回復します".to_string(),
+            ),
+            500..=599 => (
+                format!("サーバーエラー ({code})"),
+                "時間をおいて「更新」してください".to_string(),
+            ),
+            _ => (
+                format!("取得に失敗しました (HTTP {code})"),
+                "「更新」を押して再試行してください".to_string(),
+            ),
+        };
+        return Err(CollectError {
+            status: Status::Failed,
+            reason,
+            hint,
+        });
+    }
+
+    let u: CodexUsageResp = resp.json().map_err(|_| CollectError {
+        status: Status::Failed,
+        reason: "応答を解析できませんでした".into(),
+        hint: "アプリの更新が必要かもしれません".into(),
+    })?;
+    let rl = u.rate_limit.ok_or(CollectError {
+        status: Status::Failed,
+        reason: "利用枠情報がありません".into(),
+        hint: "Codex を一度使ってみてください".into(),
+    })?;
+
+    let mut windows = Vec::new();
+    if let Some(w) = rl.primary_window {
+        windows.push(UsageWindow {
+            label: "5-Hour".into(),
+            consumption: w.used_percent,
+            amount_cents: None,
+            resets_at: w.reset_at.map(epoch_to_rfc3339).unwrap_or_default(),
+        });
+    }
+    if let Some(w) = rl.secondary_window {
+        windows.push(UsageWindow {
+            label: "Weekly".into(),
+            consumption: w.used_percent,
+            amount_cents: None,
+            resets_at: w.reset_at.map(epoch_to_rfc3339).unwrap_or_default(),
+        });
+    }
+    Ok(windows)
+}
+
+// ---------- Cursor collector (state.vscdb の accessToken, 読み取り専用) ----------
+// Cursor API は利用枠の「上限」を返さない（Enterprise は INCLUDED_IN_BUSINESS のみ／
+// usage-based は $0、上限値の提供なし）。そこで「当月の実利用額(¢)」を取得し、プランの
+// 「含まれる月枠」の上限で 2 バケツに分ける（CONTEXT.md: Consumption / On-Demand）：
+//   - Monthly（含まれる枠）: min(実利用額, 上限) ÷ 上限 × 100（% 正規化, ADR-0003）
+//   - On-Demand: 上限を超えた分を金額(¢)で表示（超過があるときのみ）
+// 上限は各自のプランの included 額に合わせて変更すること。
+const CURSOR_INCLUDED_LIMIT_CENTS: f64 = 2000.0; // 既定 $20/月（含まれる枠の上限）
+
+/// Cursor の「含まれる月枠」の上限(¢)。プランは人により異なるため上書き可能：
+/// 環境変数 `HEADROOM_CURSOR_BUDGET`（ドル）→ `~/.config/headroom/config.json` の
+/// `cursorMonthlyBudgetUsd`（ドル）→ 既定 $20、の順で解決する。
+fn cursor_budget_cents() -> f64 {
+    if let Ok(usd) = std::env::var("HEADROOM_CURSOR_BUDGET").map(|v| v.trim().to_string()) {
+        if let Ok(usd) = usd.parse::<f64>() {
+            if usd > 0.0 {
+                return usd * 100.0;
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(data) = std::fs::read_to_string(format!("{home}/.config/headroom/config.json")) {
+            #[derive(Deserialize)]
+            struct Cfg {
+                #[serde(rename = "cursorMonthlyBudgetUsd")]
+                usd: Option<f64>,
+            }
+            if let Ok(Some(usd)) = serde_json::from_str::<Cfg>(&data).map(|c| c.usd) {
+                if usd > 0.0 {
+                    return usd * 100.0;
+                }
+            }
+        }
+    }
+    CURSOR_INCLUDED_LIMIT_CENTS
+}
+
+#[derive(Deserialize)]
+struct CursorAggUsage {
+    #[serde(rename = "totalCostCents")]
+    total_cost_cents: Option<f64>,
+}
+#[derive(Deserialize)]
+struct CursorReqUsage {
+    #[serde(rename = "startOfMonth")]
+    start_of_month: Option<String>,
+}
+
+fn read_cursor_token() -> Result<String, CollectError> {
+    let home = std::env::var("HOME").map_err(|_| CollectError {
+        status: Status::Failed,
+        reason: "ホームディレクトリが不明です".into(),
+        hint: "再度お試しください".into(),
+    })?;
+    let db = format!("{home}/Library/Application Support/Cursor/User/globalStorage/state.vscdb");
+    // macOS 同梱の sqlite3 で平文値を読み取る（追加依存なし・読み取り専用）
+    let out = Command::new("sqlite3")
+        .arg(&db)
+        .arg("SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken';")
+        .output()
+        .map_err(|_| CollectError {
+            status: Status::Unconnected,
+            reason: "未接続です".into(),
+            hint: "Cursor にログインすると表示されます".into(),
+        })?;
+    let token = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    if !out.status.success() || token.is_empty() {
+        return Err(CollectError {
+            status: Status::Unconnected,
+            reason: "未接続です".into(),
+            hint: "Cursor にログインすると表示されます".into(),
+        });
+    }
+    Ok(token)
+}
+
+/// best-effort: 請求サイクル開始(startOfMonth)＋30日 をリセット時刻とする
+fn cursor_reset_at(client: &reqwest::blocking::Client, token: &str) -> String {
+    let start = client
+        .get("https://api2.cursor.sh/auth/usage")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "headroom/0.1")
+        .send()
+        .ok()
+        .and_then(|r| r.json::<CursorReqUsage>().ok())
+        .and_then(|u| u.start_of_month);
+    match start.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok()) {
+        Some(t) => (t + chrono::Duration::days(30)).to_rfc3339(),
+        None => String::new(),
+    }
+}
+
+fn collect_cursor() -> Result<Vec<UsageWindow>, CollectError> {
+    let token = read_cursor_token()?;
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post("https://api2.cursor.sh/aiserver.v1.DashboardService/GetAggregatedUsageEvents")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "headroom/0.1")
+        .body("{}")
+        .send()
+        .map_err(|_| CollectError {
+            status: Status::Failed,
+            reason: "接続できません".into(),
+            hint: "ネットワーク接続を確認してください".into(),
+        })?;
+
+    if !resp.status().is_success() {
+        let code = resp.status().as_u16();
+        let (reason, hint) = match code {
+            429 => (
+                "レート制限です (429)".to_string(),
+                "少し待ってから「更新」を押してください".to_string(),
+            ),
+            401 | 403 => (
+                format!("認証エラー ({code})"),
+                "Cursor を一度起動・ログインすると回復します".to_string(),
+            ),
+            500..=599 => (
+                format!("サーバーエラー ({code})"),
+                "時間をおいて「更新」してください".to_string(),
+            ),
+            _ => (
+                format!("取得に失敗しました (HTTP {code})"),
+                "「更新」を押して再試行してください".to_string(),
+            ),
+        };
+        return Err(CollectError {
+            status: Status::Failed,
+            reason,
+            hint,
+        });
+    }
+
+    let agg: CursorAggUsage = resp.json().map_err(|_| CollectError {
+        status: Status::Failed,
+        reason: "応答を解析できませんでした".into(),
+        hint: "アプリの更新が必要かもしれません".into(),
+    })?;
+
+    let spent = agg.total_cost_cents.unwrap_or(0.0).max(0.0);
+    let limit = cursor_budget_cents();
+    let reset = cursor_reset_at(&client, &token);
+
+    // 含まれる枠（% 表示、100% 頭打ち）
+    let mut windows = vec![UsageWindow {
+        label: "Monthly".into(),
+        consumption: (spent / limit * 100.0).clamp(0.0, 100.0),
+        amount_cents: None,
+        resets_at: reset.clone(),
+    }];
+    // 含まれる枠を超えた分は On-Demand として金額表示（超過時のみ）
+    let on_demand = spent - limit;
+    if on_demand > 0.0 {
+        windows.push(UsageWindow {
+            label: "On-Demand".into(),
+            consumption: 0.0,
+            amount_cents: Some(on_demand),
+            resets_at: reset,
+        });
+    }
+    Ok(windows)
+}
+
+fn snapshot_for(name: &str, result: Result<Vec<UsageWindow>, CollectError>) -> ToolSnapshot {
+    match result {
+        Ok(windows) => ToolSnapshot {
+            display_name: name.into(),
+            status: Status::Ok,
+            windows,
+            reason: None,
+            hint: None,
+        },
+        Err(e) => ToolSnapshot {
+            display_name: name.into(),
+            status: e.status,
+            windows: vec![],
+            reason: Some(e.reason),
+            hint: Some(e.hint),
+        },
+    }
+}
+
+fn collect_all() -> Vec<ToolSnapshot> {
+    // MVP 対象（Claude → Cursor → Codex）
+    vec![
+        snapshot_for("Claude", collect_claude()),
+        snapshot_for("Cursor", collect_cursor()),
+        snapshot_for("Codex", collect_codex()),
+    ]
+}
+
+/// resets_at(ISO) → 「2時間54分後」/ 2日以上先は「6月11日」
+fn fmt_reset(iso: &str) -> String {
+    use chrono::{DateTime, Local, Utc};
+    match DateTime::parse_from_rfc3339(iso) {
+        Ok(t) => {
+            let secs = (t.with_timezone(&Utc) - Utc::now()).num_seconds();
+            if secs <= 0 {
+                "まもなくリセット".into()
+            } else if secs >= 2 * 86400 {
+                t.with_timezone(&Local).format("%-m月%-d日").to_string()
+            } else {
+                let h = secs / 3600;
+                let m = (secs % 3600) / 60;
+                if h > 0 {
+                    format!("{h}時間{m}分後")
+                } else {
+                    format!("{m}分後")
+                }
+            }
+        }
+        Err(_) => iso.to_string(),
+    }
+}
+
+/// メニュー見出し用の小さなブランド色アイコン（角の取れた円。アンチエイリアス付き）
+fn brand_dot(rgb: (u8, u8, u8)) -> tauri::image::Image<'static> {
+    let s: i32 = 18;
+    let c = (s as f32 - 1.0) / 2.0;
+    // 18px キャンバスは維持しつつ円を一回り小さく（文字との位置揃えはそのまま）
+    let rad = s as f32 / 2.0 - 3.0;
+    let mut px = vec![0u8; (s * s * 4) as usize];
+    for y in 0..s {
+        for x in 0..s {
+            let dx = x as f32 - c;
+            let dy = y as f32 - c;
+            let d = (dx * dx + dy * dy).sqrt();
+            let a = if d <= rad - 0.5 {
+                1.0
+            } else if d >= rad + 0.5 {
+                0.0
+            } else {
+                rad + 0.5 - d
+            };
+            let i = ((y * s + x) * 4) as usize;
+            px[i] = rgb.0;
+            px[i + 1] = rgb.1;
+            px[i + 2] = rgb.2;
+            px[i + 3] = (a * 255.0) as u8;
+        }
+    }
+    tauri::image::Image::new_owned(px, s as u32, s as u32)
+}
+
+/// メニューバー（トレイ）用グリフ：ゲージ（メーター）＋下部に小さく「AI」。
+/// テンプレート画像なので RGB は無視され、アルファのみが使われる
+/// （色はライト/ダークに合わせて macOS が自動反転。`icon_as_template(true)`）。
+fn menubar_icon() -> tauri::image::Image<'static> {
+    let s: i32 = 36; // 18pt @2x（Retina で潰れないよう高解像度で生成）
+    let c = (s as f32 - 1.0) / 2.0; // 水平中心 17.5
+    let gy = 19.0_f32; // ゲージ中心（やや下げて全体を縦中央に寄せる）
+
+    // 線分（カプセル）の符号付き距離。針の描画に使う。
+    fn seg(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32, th: f32) -> f32 {
+        let (pax, pay) = (px - ax, py - ay);
+        let (bax, bay) = (bx - ax, by - ay);
+        let h = ((pax * bax + pay * bay) / (bax * bax + bay * bay)).clamp(0.0, 1.0);
+        ((pax - bax * h).powi(2) + (pay - bay * h).powi(2)).sqrt() - th
+    }
+    // 距離 → 被覆率（1px のアンチエイリアス帯）
+    let cov = |d: f32| (0.5 - d).clamp(0.0, 1.0);
+    let ang = 55.0_f32.to_radians();
+    let (nx, ny) = (c + ang.cos() * 10.5, gy - ang.sin() * 10.5); // 針先端（上向き右）
+
+    // 下部の開いた部分に小さく「AI」（A=2本脚＋横棒 / I=縦棒）
+    let ai_h = 6.0_f32; // 文字高
+    let ai_th = 1.15_f32; // 線の太さ
+    let ai_cy = 26.3_f32; // 文字の縦中心
+    let acx = c - ai_h * 0.44; // A の中心x
+    let icx = c + ai_h * 0.42; // I の中心x
+    let aw = ai_h * 0.74; // A の幅
+    let (a_top, a_bot, a_cross) = (ai_cy - ai_h / 2.0, ai_cy + ai_h / 2.0, ai_cy + ai_h * 0.12);
+
+    let mut px = vec![0u8; (s * s * 4) as usize];
+    for y in 0..s {
+        for x in 0..s {
+            let (fx, fy) = (x as f32, y as f32);
+            let (dx, dy) = (fx - c, fy - gy);
+            let d = (dx * dx + dy * dy).sqrt();
+
+            // 270° スピードメーターの目盛弧（下 90° を開ける）
+            let arc = cov((d - 12.0).abs() - 2.0) * cov(dy - dx.abs());
+            // 針（中心 → 上向き右）と中心ハブ
+            let needle = cov(seg(fx, fy, c, gy, nx, ny, 1.7));
+            let hub = cov(d - 2.4);
+            // 「AI」の文字
+            let a_letter = cov(seg(fx, fy, acx, a_top, acx - aw / 2.0, a_bot, ai_th))
+                .max(cov(seg(fx, fy, acx, a_top, acx + aw / 2.0, a_bot, ai_th)))
+                .max(cov(seg(fx, fy, acx - aw * 0.30, a_cross, acx + aw * 0.30, a_cross, ai_th)));
+            let i_letter = cov(seg(fx, fy, icx, a_top, icx, a_bot, ai_th));
+            let ai = a_letter.max(i_letter);
+
+            // テンプレート画像：黒（RGB=0、初期化済み）＋アルファのみ
+            let i = ((y * s + x) * 4) as usize;
+            px[i + 3] = (arc.max(needle).max(hub).max(ai) * 255.0).round() as u8;
+        }
+    }
+    tauri::image::Image::new_owned(px, s as u32, s as u32)
+}
+
+fn tool_icon(name: &str) -> tauri::image::Image<'static> {
+    // 生成したブランド色の円（design.md §3 の暫定色）
+    if name.contains("Claude") {
+        brand_dot((217, 119, 87))
+    } else if name.contains("Cursor") {
+        brand_dot((90, 90, 95))
+    } else if name.contains("Codex") {
+        brand_dot((88, 108, 240))
+    } else {
+        brand_dot((130, 130, 135))
+    }
+}
+
+/// 取得結果からネイティブメニューを構築する（NSMenu 操作のためメインスレッドで呼ぶこと）
+fn build_menu(app: &tauri::AppHandle, tools: &[ToolSnapshot]) -> tauri::Result<Menu<tauri::Wry>> {
+    let mut b = MenuBuilder::new(app);
+    for t in tools {
+        // Tool 見出し（アイコン付き・クリックで対応アプリを起動）
+        b = b.item(
+            &IconMenuItemBuilder::with_id(format!("open:{}", t.display_name), &t.display_name)
+                .icon(tool_icon(&t.display_name))
+                .build(app)?,
+        );
+        match t.status {
+            // 利用枠は情報表示（クリック不可＝グレー）
+            Status::Ok => {
+                for w in &t.windows {
+                    // 金額枠（On-Demand）は実額、それ以外は「残り %」
+                    let value = match w.amount_cents {
+                        Some(cents) => format!("${:.2}", cents / 100.0),
+                        None => format!("残り {}%", (100.0 - w.consumption).round().max(0.0) as i64),
+                    };
+                    let line = format!("    {}  ·  {}  ·  {}", w.label, value, fmt_reset(&w.resets_at));
+                    b = b.item(&MenuItemBuilder::new(line).enabled(false).build(app)?);
+                }
+            }
+            // 失敗/未接続は理由＋対処をグレーで
+            _ => {
+                if let Some(reason) = &t.reason {
+                    b = b.item(
+                        &MenuItemBuilder::new(format!("    ⚠ {reason}"))
+                            .enabled(false)
+                            .build(app)?,
+                    );
+                }
+                if let Some(hint) = &t.hint {
+                    b = b.item(
+                        &MenuItemBuilder::new(format!("       {hint}"))
+                            .enabled(false)
+                            .build(app)?,
+                    );
+                }
+            }
+        }
+    }
+    b = b.separator();
+    b = b.item(&MenuItemBuilder::with_id("refresh", "更新").build(app)?);
+    b = b.item(&MenuItemBuilder::with_id("quit", "Quit Headroom").build(app)?);
+    b.build()
+}
+
+/// 取得（blocking）→ メインスレッドでメニュー差し替え。専用スレッドから呼ぶこと。
+fn refresh_menu(app: &tauri::AppHandle) {
+    let tools = collect_all();
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Ok(menu) = build_menu(&app2, &tools) {
+            if let Some(tray) = app2.tray_by_id("main-tray") {
+                let _ = tray.set_menu(Some(menu));
+            }
+        }
+    });
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .setup(|app| {
+            // Dock 非表示のメニューバー常駐アプリ（ADR-0002）
+            #[cfg(target_os = "macos")]
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // ログイン時に自動起動（リリースビルドのみ。System 設定 > ログイン項目 で解除可）
+            #[cfg(not(debug_assertions))]
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let _ = app.autolaunch().enable();
+            }
+
+            // 初期メニュー（取得前）
+            let loading = MenuItemBuilder::new("読み込み中…").enabled(false).build(app)?;
+            let quit = MenuItemBuilder::with_id("quit", "Quit Headroom").build(app)?;
+            let init_menu = MenuBuilder::new(app)
+                .item(&loading)
+                .separator()
+                .item(&quit)
+                .build()?;
+
+            TrayIconBuilder::with_id("main-tray")
+                .icon(menubar_icon())
+                .icon_as_template(true)
+                .tooltip("Headroom")
+                .menu(&init_menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| {
+                    let id = event.id.as_ref();
+                    if id == "quit" {
+                        app.exit(0);
+                    } else if id == "refresh" {
+                        let h = app.clone();
+                        std::thread::spawn(move || refresh_menu(&h));
+                    } else if let Some(app_name) = id.strip_prefix("open:") {
+                        // id に埋め込んだ Tool 名で対応アプリを起動（インストールされていれば）
+                        let _ = Command::new("open").args(["-a", app_name]).spawn();
+                    }
+                })
+                .build(app)?;
+
+            // 起動時に取得 → 以後 5 分ごとに更新（429 回避のため低頻度）
+            let handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                refresh_menu(&handle);
+                std::thread::sleep(std::time::Duration::from_secs(300));
+            });
+
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // メニューバー常駐：ウィンドウが無くてもアプリは終了しない（Quit のみ終了）
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                api.prevent_exit();
+            }
+        });
+}
