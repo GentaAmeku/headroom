@@ -39,13 +39,14 @@
 
 ## 開発
 
-- Claude の usage 取得（実証済み）: macOS Keychain `Claude Code-credentials` から accessToken → `GET https://api.anthropic.com/api/oauth/usage`（ヘッダ `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`）→ `five_hour` / `seven_day` の `{ utilization, resets_at }`。詳細は ADR-0001。
+- Claude の usage 取得（実証済み）: **`~/.claude/.credentials.json` の `claudeAiOauth.accessToken`** を優先（旧来の Keychain `Claude Code-credentials` は更新されず**失効**していることがあるためフォールバック扱い）→ `GET https://api.anthropic.com/api/oauth/usage`（ヘッダ `Authorization: Bearer`, `anthropic-version: 2023-06-01`, `anthropic-beta: oauth-2025-04-20`）→ `five_hour` / `seven_day` の `{ utilization, resets_at }`。`expiresAt`(epoch ms) で**失効チェック**し、失効時は取得せず案内（**自前リフレッシュはしない**＝ADR-0004）。詳細は ADR-0001。
+  - 注意: 失効した oauth トークンでこの endpoint を叩くと **429（rate_limit_error）が返る**（401 ではない）。「レート制限」と誤認しないこと。
 - レンダリング対象は macOS WKWebView（近年の WebKit）。モダン CSS（`light-dark()` / `color-mix()` / `corner-shape`）をフォールバックなしで使ってよい。
 
 ## ステータス
 
 **Claude / Cursor / Codex 実装済み**（Tauri ＋ ネイティブメニュー）。アプリ名は **Headroom**。MVP の Collector は一通り完了。
-- Claude: Keychain `Claude Code-credentials` → `GET https://api.anthropic.com/api/oauth/usage`（`anthropic-beta: oauth-2025-04-20`）→ `five_hour` / `seven_day`。
+- Claude: `~/.claude/.credentials.json`（`claudeAiOauth.accessToken`、無ければ Keychain `Claude Code-credentials` にフォールバック）→ `GET https://api.anthropic.com/api/oauth/usage`（`anthropic-version` ＋ `anthropic-beta: oauth-2025-04-20`）→ `five_hour` / `seven_day`。`expiresAt` で失効チェック。
 - Cursor: `state.vscdb`（`~/Library/Application Support/Cursor/User/globalStorage/`）の `cursorAuth/accessToken` を sqlite3 で読む → `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetAggregatedUsageEvents`（Bearer, body `{}`）→ `totalCostCents`（当月の実利用額）。**Cursor API は上限を返さない**（Enterprise は全イベント `INCLUDED_IN_BUSINESS`／usage-based $0／`GetHardLimit`=`noUsageBasedAllowed`）ため、含まれる枠の上限はユーザー設定の定数 `CURSOR_INCLUDED_LIMIT_CENTS`（既定 $20）で表現し、2 Window に分ける: **Monthly**=`min(実利用額,上限)÷上限×100`（% 正規化, ADR-0003）／**On-Demand**=上限超過分を金額表示（CONTEXT.md の On-Demand、超過時のみ）。リセットは `GET https://api2.cursor.sh/auth/usage` の `startOfMonth`＋30日。
 - Codex: `~/.codex/auth.json`（`tokens.access_token` / `account_id`）→ `GET https://chatgpt.com/backend-api/codex/usage`（`ChatGPT-Account-ID` ＋ `originator: codex_cli_rs`）→ `rate_limit.primary_window`(5h) / `secondary_window`(週次)。
 - デバッグビルド: `npm run tauri build -- --debug --bundles app` → `src-tauri/target/debug/bundle/macos/Headroom.app`。

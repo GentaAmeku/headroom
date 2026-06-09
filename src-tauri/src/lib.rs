@@ -99,6 +99,8 @@ struct ClaudeCreds {
 struct ClaudeOAuth {
     #[serde(rename = "accessToken")]
     access_token: String,
+    #[serde(rename = "expiresAt")]
+    expires_at: Option<i64>, // epoch ミリ秒
 }
 #[derive(Deserialize)]
 struct ClaudeUsage {
@@ -111,30 +113,71 @@ struct ClaudeWindow {
     resets_at: String,
 }
 
+/// 有効なら Ok(token)。期限切れなら Err(true)、トークン無し/壊れていれば Err(false)。
+fn claude_token_if_valid(o: ClaudeOAuth) -> Result<String, bool> {
+    if o.access_token.is_empty() {
+        return Err(false);
+    }
+    if let Some(exp) = o.expires_at {
+        // 失効（60秒マージン）していれば使わない。自前リフレッシュはしない（ADR-0004）。
+        if exp <= chrono::Utc::now().timestamp_millis() + 60_000 {
+            return Err(true);
+        }
+    }
+    Ok(o.access_token)
+}
+
 fn read_claude_token() -> Result<String, CollectError> {
-    let out = Command::new("security")
+    // 現行の Claude Code はリフレッシュ済みトークンを ~/.claude/.credentials.json に保存する。
+    // 旧来の Keychain (Claude Code-credentials) は更新されず失効していることがあるため、
+    // ファイル → Keychain の順に読み、失効していない方を使う（リフレッシュはしない：ADR-0004）。
+    let mut expired = false;
+    let mut check = |o: ClaudeOAuth| match claude_token_if_valid(o) {
+        Ok(tok) => Some(tok),
+        Err(is_expired) => {
+            expired |= is_expired;
+            None
+        }
+    };
+
+    // 1) ~/.claude/.credentials.json
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(data) = std::fs::read_to_string(format!("{home}/.claude/.credentials.json")) {
+            if let Ok(c) = serde_json::from_str::<ClaudeCreds>(&data) {
+                if let Some(tok) = check(c.claude_ai_oauth) {
+                    return Ok(tok);
+                }
+            }
+        }
+    }
+    // 2) Keychain (フォールバック)
+    if let Ok(out) = Command::new("security")
         .args(["find-generic-password", "-w", "-s", "Claude Code-credentials"])
         .output()
-        .map_err(|_| CollectError {
+    {
+        if out.status.success() {
+            let raw = String::from_utf8_lossy(&out.stdout);
+            if let Ok(c) = serde_json::from_str::<ClaudeCreds>(raw.trim()) {
+                if let Some(tok) = check(c.claude_ai_oauth) {
+                    return Ok(tok);
+                }
+            }
+        }
+    }
+
+    if expired {
+        Err(CollectError {
             status: Status::Failed,
-            reason: "資格情報を取得できません".into(),
-            hint: "もう一度「更新」を押してください".into(),
-        })?;
-    if !out.status.success() {
-        return Err(CollectError {
+            reason: "認証の有効期限切れ".into(),
+            hint: "Claude Code を一度使うと自動で更新されます".into(),
+        })
+    } else {
+        Err(CollectError {
             status: Status::Unconnected,
             reason: "未接続です".into(),
             hint: "Claude にログインすると表示されます".into(),
-        });
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str::<ClaudeCreds>(raw.trim())
-        .map(|c| c.claude_ai_oauth.access_token)
-        .map_err(|_| CollectError {
-            status: Status::Failed,
-            reason: "資格情報を解析できません".into(),
-            hint: "Claude に再ログインしてください".into(),
         })
+    }
 }
 
 /// blocking 取得（専用スレッドから呼ぶ。tauri の async runtime 上では呼ばない）
@@ -144,6 +187,7 @@ fn collect_claude(name: &'static str) -> Result<Vec<UsageWindow>, CollectError> 
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", format!("Bearer {token}"))
+        .header("anthropic-version", "2023-06-01")
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("User-Agent", "headroom/0.1")
         .send()
