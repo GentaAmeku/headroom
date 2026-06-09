@@ -1,6 +1,6 @@
 {
   "name": "headroom",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "macOS menu bar app showing AI coding tool (Claude, Cursor, Codex) usage quotas at a glance",
   "license": "MIT",
   "private": true,
