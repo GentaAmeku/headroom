@@ -46,7 +46,7 @@ jobs:
             Unsigned macOS build (universal). Install via Homebrew (recommended):
 
             ```
-            brew install --cask --no-quarantine GentaAmeku/tap/headroom
+            brew install --cask GentaAmeku/tap/headroom
             ```
 
             Or download the .dmg and run `xattr -dr com.apple.quarantine /Applications/Headroom.app` once.

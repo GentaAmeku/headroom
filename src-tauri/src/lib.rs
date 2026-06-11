@@ -1,12 +1,16 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{
     menu::{IconMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
+    Manager,
 };
+
+struct QuitState(AtomicBool);
 
 // ---------- i18n（OS ロケール or ~/.config/headroom/config.json の "language" で ja/en を選択） ----------
 #[derive(Clone, Copy, PartialEq)]
@@ -822,6 +826,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .manage(QuitState(AtomicBool::new(false)))
         .setup(|app| {
             // Dock 非表示のメニューバー常駐アプリ（ADR-0002）
             #[cfg(target_os = "macos")]
@@ -852,6 +857,7 @@ pub fn run() {
                 .on_menu_event(|app, event| {
                     let id = event.id.as_ref();
                     if id == "quit" {
+                        app.state::<QuitState>().0.store(true, Ordering::SeqCst);
                         app.exit(0);
                     } else if id == "refresh" {
                         let h = app.clone();
@@ -874,10 +880,12 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
+        .run(|app, event| {
             // メニューバー常駐：ウィンドウが無くてもアプリは終了しない（Quit のみ終了）
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                api.prevent_exit();
+                if !app.state::<QuitState>().0.load(Ordering::SeqCst) {
+                    api.prevent_exit();
+                }
             }
         });
 }

@@ -8,9 +8,9 @@
 #      (or keep `sha256 :no_check` for a personal tap).
 #
 # Users then install with:
-#   brew install --cask --no-quarantine GentaAmeku/tap/headroom
+#   brew install --cask GentaAmeku/tap/headroom
 cask "headroom" do
-  version "0.1.1"
+  version "0.1.2"
   sha256 :no_check
 
   url "https://github.com/GentaAmeku/headroom/releases/download/v#{version}/Headroom_#{version}_universal.dmg"
@@ -18,7 +18,7 @@ cask "headroom" do
   desc "Menu bar app showing AI coding tool usage at a glance"
   homepage "https://github.com/GentaAmeku/headroom"
 
-  depends_on macos: ">= :big_sur"
+  depends_on macos: :big_sur
 
   app "Headroom.app"
 
@@ -27,4 +27,9 @@ cask "headroom" do
     "~/Library/Application Support/com.gameku.headroom",
     "~/Library/Caches/com.gameku.headroom",
   ]
+
+  caveats <<~EOS
+    Headroom is unsigned. If macOS blocks it on first launch, remove the quarantine attribute:
+      xattr -dr com.apple.quarantine /Applications/Headroom.app
+  EOS
 end

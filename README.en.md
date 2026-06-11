@@ -30,16 +30,20 @@ Each tool appears only if you're signed in to it; otherwise Headroom shows a gen
 ### Homebrew (recommended)
 
 ```sh
-brew install --cask --no-quarantine GentaAmeku/tap/headroom
+brew install --cask GentaAmeku/tap/headroom
 ```
 
-The app is not code-signed (it's a free, open-source utility), so `--no-quarantine` lets it open without a Gatekeeper prompt.
+The app is not code-signed (it's a free, open-source utility), so macOS may show a Gatekeeper prompt on first launch. If that happens, right-click the app → **Open** once, or remove the quarantine attribute:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Headroom.app
+```
 
 ### Manual
 
 1. Download `Headroom_<version>_universal.dmg` from [Releases](https://github.com/GentaAmeku/headroom/releases).
 2. Drag **Headroom.app** into Applications.
-3. On first launch, right-click the app → **Open** (once), or run:
+3. If macOS shows a Gatekeeper prompt on first launch, right-click the app → **Open** once, or run:
    ```sh
    xattr -dr com.apple.quarantine /Applications/Headroom.app
    ```

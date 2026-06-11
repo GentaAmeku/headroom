@@ -30,16 +30,20 @@ AI コーディングツールの**利用枠の残量を一目で**把握する 
 ### Homebrew（推奨）
 
 ```sh
-brew install --cask --no-quarantine GentaAmeku/tap/headroom
+brew install --cask GentaAmeku/tap/headroom
 ```
 
-このアプリはコード署名していない（無料・オープンソースのユーティリティ）ため、`--no-quarantine` を付けると Gatekeeper の警告なしで起動できます。
+このアプリはコード署名していない（無料・オープンソースのユーティリティ）ため、初回起動時に Gatekeeper の警告が出る場合があります。その場合はアプリを右クリック →「**開く**」（1回だけ）、または次のコマンドで quarantine 属性を削除してください:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Headroom.app
+```
 
 ### 手動
 
 1. [Releases](https://github.com/GentaAmeku/headroom/releases) から `Headroom_<version>_universal.dmg` をダウンロード。
 2. **Headroom.app** を Applications にドラッグ。
-3. 初回起動はアプリを右クリック →「**開く**」（1回だけ）、または:
+3. 初回起動時に Gatekeeper の警告が出る場合は、アプリを右クリック →「**開く**」（1回だけ）、または:
    ```sh
    xattr -dr com.apple.quarantine /Applications/Headroom.app
    ```
