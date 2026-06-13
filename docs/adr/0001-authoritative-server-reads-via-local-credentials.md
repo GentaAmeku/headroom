@@ -23,6 +23,6 @@
 
 - **エンドポイント**: `GET https://api.anthropic.com/api/oauth/usage`
 - **必須ヘッダ**: `Authorization: Bearer <accessToken>`, `anthropic-beta: oauth-2025-04-20`
-- **認証情報の一次ソースは macOS Keychain**（サービス名 `Claude Code-credentials`）。`~/.claude/.credentials.json` は古いコピーになり得るためフォールバック扱い。トークン失効時は `/v1/oauth/token` でリフレッシュ可能（refreshToken ローテーションに注意し、更新後は元のストアに書き戻す必要がある）。
+- **認証情報のソースは macOS Keychain**（サービス名 `Claude Code-credentials`）**と `~/.claude/.credentials.json` の両方**。Claude Code のバージョン/操作によって、片方だけが更新されることがあるため、実装では両方を読み、`expiresAt` が未失効の候補のうち最も新しいものを使う。トークン失効時は `/v1/oauth/token` でリフレッシュ可能だが、refreshToken ローテーションに注意し、更新後は元のストアに書き戻す必要がある。
 - **レスポンス**: `five_hour` / `seven_day` がそれぞれ `{ utilization: 0-100, resets_at: ISO8601 }` を返す（= Consumption と Reset）。加えてモデル別週次枠 `seven_day_opus` / `seven_day_sonnet`（該当プランのみ）、サブスク超過従量 `extra_usage` を含む。
 - → Claude については B 案の実現性が**確定**。

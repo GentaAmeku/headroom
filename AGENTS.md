@@ -39,15 +39,15 @@
 
 ## 開発
 
-- Claude の usage 取得（実証済み）: **`~/.claude/.credentials.json` の `claudeAiOauth.accessToken`** を優先（旧来の Keychain `Claude Code-credentials` は更新されず**失効**していることがあるためフォールバック扱い）→ `GET https://api.anthropic.com/api/oauth/usage`（ヘッダ `Authorization: Bearer`, `anthropic-version: 2023-06-01`, `anthropic-beta: oauth-2025-04-20`）→ `five_hour` / `seven_day` の `{ utilization, resets_at }`。`expiresAt`(epoch ms) で**失効チェック**し、失効時は取得せず案内（**自前リフレッシュはしない**＝ADR-0004）。詳細は ADR-0001。
-  - 注意: 失効した oauth トークンでこの endpoint を叩くと **429（rate_limit_error）が返る**（401 ではない）。「レート制限」と誤認しないこと。
+- Claude の usage 取得（実証済み）: **`~/.claude/.credentials.json` と Keychain `Claude Code-credentials` の両方**から `claudeAiOauth.accessToken` を読み、`expiresAt`(epoch ms) が未失効の候補のうち最も新しいものを使う（Claude Code のバージョン/操作により更新される保存先が揺れるため）→ `GET https://api.anthropic.com/api/oauth/usage`（ヘッダ `Authorization: Bearer`, `anthropic-version: 2023-06-01`, `anthropic-beta: oauth-2025-04-20`）→ `five_hour` / `seven_day` の `{ utilization, resets_at }`。失効時は取得せず案内（**自前リフレッシュはしない**＝ADR-0004）。詳細は ADR-0001。
+  - 注意: 失効した oauth トークンでこの endpoint を叩くと **401（authentication_error）** になることを 2026-06-13 に確認済み。429 は取得 API 側の一時制限として扱い、「利用枠の枯渇」と誤認しないこと。
 - レンダリング対象は macOS WKWebView（近年の WebKit）。モダン CSS（`light-dark()` / `color-mix()` / `corner-shape`）をフォールバックなしで使ってよい。
 - **多言語（i18n）**: UI 文字列は `tr(ja, en)` ヘルパで日本語/英語を出し分ける。言語は OS ロケール（`sys-locale`、`ja*`→日本語/それ以外→英語）で自動判定。`~/.config/headroom/config.json` の `"language": "ja"|"en"` で上書き可。新規の表示文字列は必ず `tr()`（または `match lang()`）でラップすること。
 
 ## ステータス
 
 **Claude / Cursor / Codex 実装済み**（Tauri ＋ ネイティブメニュー）。アプリ名は **Headroom**。MVP の Collector は一通り完了。
-- Claude: `~/.claude/.credentials.json`（`claudeAiOauth.accessToken`、無ければ Keychain `Claude Code-credentials` にフォールバック）→ `GET https://api.anthropic.com/api/oauth/usage`（`anthropic-version` ＋ `anthropic-beta: oauth-2025-04-20`）→ `five_hour` / `seven_day`。`expiresAt` で失効チェック。
+- Claude: `~/.claude/.credentials.json` と Keychain `Claude Code-credentials` の `claudeAiOauth.accessToken` を読み、`expiresAt` が最も新しい未失効トークンを使う → `GET https://api.anthropic.com/api/oauth/usage`（`anthropic-version` ＋ `anthropic-beta: oauth-2025-04-20`）→ `five_hour` / `seven_day`。自前リフレッシュはしない。
 - Cursor: `state.vscdb`（`~/Library/Application Support/Cursor/User/globalStorage/`）の `cursorAuth/accessToken` を sqlite3 で読む → `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetAggregatedUsageEvents`（Bearer, body `{}`）→ `totalCostCents`（当月の実利用額）。**Cursor API は上限を返さない**（Enterprise は全イベント `INCLUDED_IN_BUSINESS`／usage-based $0／`GetHardLimit`=`noUsageBasedAllowed`）ため、含まれる枠の上限はユーザー設定の定数 `CURSOR_INCLUDED_LIMIT_CENTS`（既定 $20）で表現し、2 Window に分ける: **Monthly**=`min(実利用額,上限)÷上限×100`（% 正規化, ADR-0003）／**On-Demand**=上限超過分を金額表示（CONTEXT.md の On-Demand、超過時のみ）。リセットは `GET https://api2.cursor.sh/auth/usage` の `startOfMonth`＋30日。
 - Codex: `~/.codex/auth.json`（`tokens.access_token` / `account_id`）→ `GET https://chatgpt.com/backend-api/codex/usage`（`ChatGPT-Account-ID` ＋ `originator: codex_cli_rs`）→ `rate_limit.primary_window`(5h) / `secondary_window`(週次)。
 - デバッグビルド: `npm run tauri build -- --debug --bundles app` → `src-tauri/target/debug/bundle/macos/Headroom.app`。

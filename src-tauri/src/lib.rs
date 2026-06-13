@@ -102,7 +102,11 @@ fn tool_cache() -> &'static Mutex<HashMap<&'static str, ToolCache>> {
 
 /// HTTP 失敗を CollectError に変換。429 のときは `retry-after` を読んでクールダウンを記録する
 /// （= その間は再取得しない。利用枠ではなく usage 取得 API 側の制限）。
-fn http_error(name: &'static str, resp: &reqwest::blocking::Response, auth_hint: &str) -> CollectError {
+fn http_error(
+    name: &'static str,
+    resp: &reqwest::blocking::Response,
+    auth_hint: &str,
+) -> CollectError {
     let code = resp.status().as_u16();
     if code == 429 {
         let secs = resp
@@ -112,13 +116,18 @@ fn http_error(name: &'static str, resp: &reqwest::blocking::Response, auth_hint:
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(900);
         if let Ok(mut c) = tool_cache().lock() {
-            c.entry(name).or_default().cooldown_until = Some(Instant::now() + Duration::from_secs(secs));
+            c.entry(name).or_default().cooldown_until =
+                Some(Instant::now() + Duration::from_secs(secs));
         }
     }
     let (reason, hint) = match code {
         429 => (
             tr("取得が一時的に制限中", "Fetch rate-limited").to_string(),
-            tr("利用枠ではなく取得APIの制限です。後で自動再取得します", "Usage API is throttled (not your quota). Retrying soon.").to_string(),
+            tr(
+                "利用枠ではなく取得APIの制限です。後で自動再取得します",
+                "Usage API is throttled (not your quota). Retrying soon.",
+            )
+            .to_string(),
         ),
         401 | 403 => (
             format!("{} ({code})", tr("認証エラー", "Auth error")),
@@ -126,11 +135,19 @@ fn http_error(name: &'static str, resp: &reqwest::blocking::Response, auth_hint:
         ),
         500..=599 => (
             format!("{} ({code})", tr("サーバーエラー", "Server error")),
-            tr("時間をおいて「更新」してください", "Try Refresh again later").to_string(),
+            tr(
+                "時間をおいて「更新」してください",
+                "Try Refresh again later",
+            )
+            .to_string(),
         ),
         _ => (
             format!("{} (HTTP {code})", tr("取得に失敗しました", "Fetch failed")),
-            tr("「更新」を押して再試行してください", "Press Refresh to retry").to_string(),
+            tr(
+                "「更新」を押して再試行してください",
+                "Press Refresh to retry",
+            )
+            .to_string(),
         ),
     };
     CollectError {
@@ -164,8 +181,8 @@ struct ClaudeWindow {
     resets_at: String,
 }
 
-/// 有効なら Ok(token)。期限切れなら Err(true)、トークン無し/壊れていれば Err(false)。
-fn claude_token_if_valid(o: ClaudeOAuth) -> Result<String, bool> {
+/// 有効なら Ok(token, expires_at)。期限切れなら Err(true)、トークン無し/壊れていれば Err(false)。
+fn claude_token_if_valid(o: ClaudeOAuth) -> Result<(String, Option<i64>), bool> {
     if o.access_token.is_empty() {
         return Err(false);
     }
@@ -175,58 +192,122 @@ fn claude_token_if_valid(o: ClaudeOAuth) -> Result<String, bool> {
             return Err(true);
         }
     }
-    Ok(o.access_token)
+    Ok((o.access_token, o.expires_at))
+}
+
+fn consider_claude_token(
+    best: &mut Option<(String, Option<i64>)>,
+    expired: &mut bool,
+    oauth: ClaudeOAuth,
+) {
+    match claude_token_if_valid(oauth) {
+        Ok(candidate) => {
+            let candidate_exp = candidate.1.unwrap_or(i64::MIN);
+            let best_exp = best.as_ref().and_then(|(_, exp)| *exp).unwrap_or(i64::MIN);
+            if best.is_none() || candidate_exp > best_exp {
+                *best = Some(candidate);
+            }
+        }
+        Err(is_expired) => {
+            *expired |= is_expired;
+        }
+    }
+}
+
+#[cfg(test)]
+mod claude_token_tests {
+    use super::{consider_claude_token, ClaudeOAuth};
+
+    fn oauth(token: &str, expires_at: i64) -> ClaudeOAuth {
+        ClaudeOAuth {
+            access_token: token.into(),
+            expires_at: Some(expires_at),
+        }
+    }
+
+    #[test]
+    fn picks_latest_unexpired_token_across_sources() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut best = None;
+        let mut expired = false;
+
+        consider_claude_token(&mut best, &mut expired, oauth("older", now + 10 * 60_000));
+        consider_claude_token(&mut best, &mut expired, oauth("newer", now + 20 * 60_000));
+
+        assert_eq!(best.map(|(token, _)| token).as_deref(), Some("newer"));
+        assert!(!expired);
+    }
+
+    #[test]
+    fn ignores_expired_token_when_valid_candidate_exists() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut best = None;
+        let mut expired = false;
+
+        consider_claude_token(&mut best, &mut expired, oauth("valid", now + 10 * 60_000));
+        consider_claude_token(&mut best, &mut expired, oauth("expired", now - 10 * 60_000));
+
+        assert_eq!(best.map(|(token, _)| token).as_deref(), Some("valid"));
+        assert!(expired);
+    }
 }
 
 fn read_claude_token() -> Result<String, CollectError> {
-    // 現行の Claude Code はリフレッシュ済みトークンを ~/.claude/.credentials.json に保存する。
-    // 旧来の Keychain (Claude Code-credentials) は更新されず失効していることがあるため、
-    // ファイル → Keychain の順に読み、失効していない方を使う（リフレッシュはしない：ADR-0004）。
+    // Claude Code の保存先はバージョンや操作によって揺れるため、
+    // ファイルと Keychain の両方を読み、失効していない候補のうち expiresAt が最も新しいものを使う。
+    // リフレッシュや書き戻しはしない（ADR-0004）。
     let mut expired = false;
-    let mut check = |o: ClaudeOAuth| match claude_token_if_valid(o) {
-        Ok(tok) => Some(tok),
-        Err(is_expired) => {
-            expired |= is_expired;
-            None
-        }
-    };
+    let mut best: Option<(String, Option<i64>)> = None;
 
-    // 1) ~/.claude/.credentials.json
+    // ~/.claude/.credentials.json
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(data) = std::fs::read_to_string(format!("{home}/.claude/.credentials.json")) {
             if let Ok(c) = serde_json::from_str::<ClaudeCreds>(&data) {
-                if let Some(tok) = check(c.claude_ai_oauth) {
-                    return Ok(tok);
-                }
+                consider_claude_token(&mut best, &mut expired, c.claude_ai_oauth);
             }
         }
     }
-    // 2) Keychain (フォールバック)
+    // Keychain
     if let Ok(out) = Command::new("security")
-        .args(["find-generic-password", "-w", "-s", "Claude Code-credentials"])
+        .args([
+            "find-generic-password",
+            "-w",
+            "-s",
+            "Claude Code-credentials",
+        ])
         .output()
     {
         if out.status.success() {
             let raw = String::from_utf8_lossy(&out.stdout);
             if let Ok(c) = serde_json::from_str::<ClaudeCreds>(raw.trim()) {
-                if let Some(tok) = check(c.claude_ai_oauth) {
-                    return Ok(tok);
-                }
+                consider_claude_token(&mut best, &mut expired, c.claude_ai_oauth);
             }
         }
+    }
+
+    if let Some((token, _)) = best {
+        return Ok(token);
     }
 
     if expired {
         Err(CollectError {
             status: Status::Failed,
             reason: tr("認証の有効期限切れ", "Authentication expired").into(),
-            hint: tr("Claude Code を一度使うと自動で更新されます", "Use Claude Code once to refresh").into(),
+            hint: tr(
+                "Claude Code に再ログインしてください",
+                "Sign in to Claude Code again",
+            )
+            .into(),
         })
     } else {
         Err(CollectError {
             status: Status::Unconnected,
             reason: tr("未接続です", "Not connected").into(),
-            hint: tr("Claude にログインすると表示されます", "Sign in to Claude to see usage").into(),
+            hint: tr(
+                "Claude にログインすると表示されます",
+                "Sign in to Claude to see usage",
+            )
+            .into(),
         })
     }
 }
@@ -245,17 +326,32 @@ fn collect_claude(name: &'static str) -> Result<Vec<UsageWindow>, CollectError> 
         .map_err(|_| CollectError {
             status: Status::Failed,
             reason: tr("接続できません", "Can't connect").into(),
-            hint: tr("ネットワーク接続を確認してください", "Check your network connection").into(),
+            hint: tr(
+                "ネットワーク接続を確認してください",
+                "Check your network connection",
+            )
+            .into(),
         })?;
 
     if !resp.status().is_success() {
-        return Err(http_error(name, &resp, tr("Claude を一度起動・使用すると回復します", "Open and use Claude once to recover")));
+        return Err(http_error(
+            name,
+            &resp,
+            tr(
+                "Claude を一度起動・使用すると回復します",
+                "Open and use Claude once to recover",
+            ),
+        ));
     }
 
     let u: ClaudeUsage = resp.json().map_err(|_| CollectError {
         status: Status::Failed,
         reason: tr("応答を解析できませんでした", "Couldn't parse the response").into(),
-        hint: tr("アプリの更新が必要かもしれません", "The app may need an update").into(),
+        hint: tr(
+            "アプリの更新が必要かもしれません",
+            "The app may need an update",
+        )
+        .into(),
     })?;
 
     let mut windows = Vec::new();
@@ -315,13 +411,16 @@ fn read_codex_auth() -> Result<(String, String), CollectError> {
         reason: tr("ホームディレクトリが不明です", "Home directory not found").into(),
         hint: tr("再度お試しください", "Please try again").into(),
     })?;
-    let data = std::fs::read_to_string(format!("{home}/.codex/auth.json")).map_err(|_| {
-        CollectError {
+    let data =
+        std::fs::read_to_string(format!("{home}/.codex/auth.json")).map_err(|_| CollectError {
             status: Status::Unconnected,
             reason: tr("未接続です", "Not connected").into(),
-            hint: tr("Codex にログインすると表示されます", "Sign in to Codex to see usage").into(),
-        }
-    })?;
+            hint: tr(
+                "Codex にログインすると表示されます",
+                "Sign in to Codex to see usage",
+            )
+            .into(),
+        })?;
     let auth: CodexAuth = serde_json::from_str(&data).map_err(|_| CollectError {
         status: Status::Failed,
         reason: tr("資格情報を解析できません", "Couldn't parse credentials").into(),
@@ -343,17 +442,32 @@ fn collect_codex(name: &'static str) -> Result<Vec<UsageWindow>, CollectError> {
         .map_err(|_| CollectError {
             status: Status::Failed,
             reason: tr("接続できません", "Can't connect").into(),
-            hint: tr("ネットワーク接続を確認してください", "Check your network connection").into(),
+            hint: tr(
+                "ネットワーク接続を確認してください",
+                "Check your network connection",
+            )
+            .into(),
         })?;
 
     if !resp.status().is_success() {
-        return Err(http_error(name, &resp, tr("Codex を一度起動・使用すると回復します", "Open and use Codex once to recover")));
+        return Err(http_error(
+            name,
+            &resp,
+            tr(
+                "Codex を一度起動・使用すると回復します",
+                "Open and use Codex once to recover",
+            ),
+        ));
     }
 
     let u: CodexUsageResp = resp.json().map_err(|_| CollectError {
         status: Status::Failed,
         reason: tr("応答を解析できませんでした", "Couldn't parse the response").into(),
-        hint: tr("アプリの更新が必要かもしれません", "The app may need an update").into(),
+        hint: tr(
+            "アプリの更新が必要かもしれません",
+            "The app may need an update",
+        )
+        .into(),
     })?;
     let rl = u.rate_limit.ok_or(CollectError {
         status: Status::Failed,
@@ -444,7 +558,11 @@ fn read_cursor_token() -> Result<String, CollectError> {
         .map_err(|_| CollectError {
             status: Status::Unconnected,
             reason: tr("未接続です", "Not connected").into(),
-            hint: tr("Cursor にログインすると表示されます", "Sign in to Cursor to see usage").into(),
+            hint: tr(
+                "Cursor にログインすると表示されます",
+                "Sign in to Cursor to see usage",
+            )
+            .into(),
         })?;
     let token = String::from_utf8_lossy(&out.stdout)
         .trim()
@@ -454,7 +572,11 @@ fn read_cursor_token() -> Result<String, CollectError> {
         return Err(CollectError {
             status: Status::Unconnected,
             reason: tr("未接続です", "Not connected").into(),
-            hint: tr("Cursor にログインすると表示されます", "Sign in to Cursor to see usage").into(),
+            hint: tr(
+                "Cursor にログインすると表示されます",
+                "Sign in to Cursor to see usage",
+            )
+            .into(),
         });
     }
     Ok(token)
@@ -489,17 +611,32 @@ fn collect_cursor(name: &'static str) -> Result<Vec<UsageWindow>, CollectError> 
         .map_err(|_| CollectError {
             status: Status::Failed,
             reason: tr("接続できません", "Can't connect").into(),
-            hint: tr("ネットワーク接続を確認してください", "Check your network connection").into(),
+            hint: tr(
+                "ネットワーク接続を確認してください",
+                "Check your network connection",
+            )
+            .into(),
         })?;
 
     if !resp.status().is_success() {
-        return Err(http_error(name, &resp, tr("Cursor を一度起動・ログインすると回復します", "Open and sign in to Cursor to recover")));
+        return Err(http_error(
+            name,
+            &resp,
+            tr(
+                "Cursor を一度起動・ログインすると回復します",
+                "Open and sign in to Cursor to recover",
+            ),
+        ));
     }
 
     let agg: CursorAggUsage = resp.json().map_err(|_| CollectError {
         status: Status::Failed,
         reason: tr("応答を解析できませんでした", "Couldn't parse the response").into(),
-        hint: tr("アプリの更新が必要かもしれません", "The app may need an update").into(),
+        hint: tr(
+            "アプリの更新が必要かもしれません",
+            "The app may need an update",
+        )
+        .into(),
     })?;
 
     let spent = agg.total_cost_cents.unwrap_or(0.0).max(0.0);
@@ -552,7 +689,13 @@ fn collect_tool(
                         hint: if has {
                             None
                         } else {
-                            Some(tr("利用枠ではなく取得APIの制限です", "Usage API is throttled, not your quota").into())
+                            Some(
+                                tr(
+                                    "利用枠ではなく取得APIの制限です",
+                                    "Usage API is throttled, not your quota",
+                                )
+                                .into(),
+                            )
                         },
                     };
                 }
@@ -703,7 +846,15 @@ fn menubar_icon() -> tauri::image::Image<'static> {
             // 「AI」の文字
             let a_letter = cov(seg(fx, fy, acx, a_top, acx - aw / 2.0, a_bot, ai_th))
                 .max(cov(seg(fx, fy, acx, a_top, acx + aw / 2.0, a_bot, ai_th)))
-                .max(cov(seg(fx, fy, acx - aw * 0.30, a_cross, acx + aw * 0.30, a_cross, ai_th)));
+                .max(cov(seg(
+                    fx,
+                    fy,
+                    acx - aw * 0.30,
+                    a_cross,
+                    acx + aw * 0.30,
+                    a_cross,
+                    ai_th,
+                )));
             let i_letter = cov(seg(fx, fy, icx, a_top, icx, a_bot, ai_th));
             let ai = a_letter.max(i_letter);
 
@@ -758,7 +909,11 @@ fn build_menu(app: &tauri::AppHandle, tools: &[ToolSnapshot]) -> tauri::Result<M
                         w.label,
                         value,
                         fmt_reset(&w.resets_at),
-                        if t.stale { tr("  ·  前回値", "  ·  cached") } else { "" }
+                        if t.stale {
+                            tr("  ·  前回値", "  ·  cached")
+                        } else {
+                            ""
+                        }
                     );
                     b = b.item(&MenuItemBuilder::new(line).enabled(false).build(app)?);
                 }
@@ -801,7 +956,9 @@ fn build_menu(app: &tauri::AppHandle, tools: &[ToolSnapshot]) -> tauri::Result<M
     }
     b = b.separator();
     b = b.item(&MenuItemBuilder::with_id("refresh", tr("更新", "Refresh")).build(app)?);
-    b = b.item(&MenuItemBuilder::with_id("quit", tr("Headroom を終了", "Quit Headroom")).build(app)?);
+    b = b.item(
+        &MenuItemBuilder::with_id("quit", tr("Headroom を終了", "Quit Headroom")).build(app)?,
+    );
     b.build()
 }
 
@@ -840,8 +997,11 @@ pub fn run() {
             }
 
             // 初期メニュー（取得前）
-            let loading = MenuItemBuilder::new(tr("読み込み中…", "Loading…")).enabled(false).build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", tr("Headroom を終了", "Quit Headroom")).build(app)?;
+            let loading = MenuItemBuilder::new(tr("読み込み中…", "Loading…"))
+                .enabled(false)
+                .build(app)?;
+            let quit = MenuItemBuilder::with_id("quit", tr("Headroom を終了", "Quit Headroom"))
+                .build(app)?;
             let init_menu = MenuBuilder::new(app)
                 .item(&loading)
                 .separator()
